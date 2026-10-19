@@ -1,4 +1,2 @@
-# Travels with the crate when it moves to its own repository.
 /target
-# Library crate; the lockfile is decided at the destination repo.
 Cargo.lock
