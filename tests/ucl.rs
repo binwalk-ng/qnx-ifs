@@ -1,4 +1,5 @@
 //! UCL NRV2B decoder checks against reference-compressor vectors.
+#![cfg(feature = "ucl")]
 #![allow(clippy::panic)] // test assertions panic by design
 
 mod common;

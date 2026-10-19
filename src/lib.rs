@@ -49,6 +49,7 @@
 
 pub mod error;
 pub mod image;
+#[cfg(feature = "ucl")]
 pub mod ucl;
 
 pub use error::Error;
