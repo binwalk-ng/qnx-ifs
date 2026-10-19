@@ -1,0 +1,78 @@
+name: Quality Checks
+
+on:
+  pull_request:
+    branches: [ '*' ]
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: Formatting (rustfmt)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Formatting (rustfmt)
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Lint (clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+  test:
+    name: Tests (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - features: default
+            args: ""
+          - features: all
+            args: "--all-features"
+          - features: none
+            args: "--no-default-features"
+          - features: zlib only
+            args: "--no-default-features --features zlib"
+          - features: lzo only
+            args: "--no-default-features --features lzo"
+          - features: ucl only
+            args: "--no-default-features --features ucl"
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+
+      - name: Tests
+        run: cargo test ${{ matrix.args }}
