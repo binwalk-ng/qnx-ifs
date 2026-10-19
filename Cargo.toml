@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/binwalk-ng/qnx-ifs"
 rust-version = "1.88"
 description = "Pure-Rust parser and decompressor for QNX IFS (Image File System) firmware images"
 keywords = ["qnx", "firmware", "ifs", "parser", "security"]
@@ -15,10 +16,6 @@ redundant_clone = "warn"
 redundant_as_str = "warn"
 panic = "warn"
 nursery = "warn"
-
-# NOTE: This crate is intentionally *not* a workspace member of binwalk-ng.
-# It will be moved to its own repository/directory later; keeping it independent
-# now means the move is a plain `git mv` with no manifest surgery.
 
 [features]
 default = ["zlib", "lzo", "ucl"]
