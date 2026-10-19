@@ -1,0 +1,40 @@
+[package]
+name = "qnx-ifs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+readme = "README.md"
+rust-version = "1.88"
+description = "Pure-Rust parser and decompressor for QNX IFS (Image File System) firmware images"
+keywords = ["qnx", "firmware", "ifs", "parser", "security"]
+categories = ["parser-implementations", "filesystem", "security"]
+
+[lints.clippy]
+redundant_type_annotations = "warn"
+redundant_clone = "warn"
+redundant_as_str = "warn"
+panic = "warn"
+nursery = "warn"
+
+# NOTE: This crate is intentionally *not* a workspace member of binwalk-ng.
+# It will be moved to its own repository/directory later; keeping it independent
+# now means the move is a plain `git mv` with no manifest surgery.
+
+[features]
+default = ["zlib", "lzo", "ucl"]
+# zlib decompression of compressed IFS regions (also accepts gzip framing)
+zlib = ["dep:flate2"]
+# LZO1X block decompression (mkifs --compress=lzo)
+lzo = ["dep:lzo"]
+# UCL NRV2B block decompression (mkifs --compress=ucl); clean-room, no deps
+ucl = []
+
+[dependencies]
+zerocopy = { version = "0.8.28", features = ["derive"] }
+flate2 = { version = "1.1.10", optional = true }
+lzo = { version = "0.1.4", optional = true }
+
+[dev-dependencies]
+# Independent pure-Rust LZO1X compressor, used only to generate round-trip
+# fixtures for the chunked stream format (cross-validate lzo crate decoding).
+lzokay = "2.0.1"
