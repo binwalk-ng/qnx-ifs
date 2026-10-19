@@ -71,7 +71,7 @@ disabled individually:
 | `ucl` | yes | UCL NRV2B block decompression (clean-room, no dependencies) |
 
 Images with the corresponding compression flag but without the feature
-enabled are rejected with `Error::UnsupportedCompression`.
+enabled fail to parse with `Error::FeatureDisabled`.
 
 ## Extraction
 
