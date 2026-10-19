@@ -1,0 +1,599 @@
+//! QNX IFS image filesystem header and directory entry parsing.
+//!
+//! The image filesystem ("imagefs") header is followed by a flat chain of
+//! variable size directory entries, each storing its own full path without
+//! a leading slash. All fields use the byte order selected by the
+//! `IMAGE_FLAGS_BIGENDIAN` header flag.
+//!
+//! Entry layout (fixed part), as produced by `mkifs`:
+//!
+//! ```text
+//! struct image_attr:      24 bytes, part of every entry
+//!   u16 size              size of this dirent
+//!   u16 extattr_offset    offset of extended attributes, 0 = none
+//!   u32 ino               inode number
+//!   u32 mode              type and permission bits
+//!   u32 gid               group id (stored before uid)
+//!   u32 uid               user id
+//!   u32 mtime             modification time (unix epoch)
+//!
+//! image_file:    attr ++ u32 offset ++ u32 size ++ NUL terminated path
+//!                (file data at [hdr + offset, size])
+//! image_dir:     attr ++ NUL terminated path
+//! image_symlink: attr ++ u16 sym_offset ++ u16 sym_size ++ path ++ target
+//!                (sym_offset is relative to `path`; target string of
+//!                 sym_size bytes follows the path, inline in the dirent)
+//! image_device:  attr ++ u32 dev ++ u32 rdev ++ path
+//! ```
+
+use zerocopy::{
+    FromBytes, Immutable, KnownLayout, U16, U32, Unaligned,
+    byteorder::{BE, ByteOrder, LE},
+};
+
+use crate::error::Error;
+use crate::startup::Endian;
+
+/// Image filesystem signature.
+pub const IMAGE_SIGNATURE: &[u8; 7] = b"imagefs";
+
+/// File type selector for mode bits.
+pub const S_IFMT: u32 = 0o170000;
+/// FIFO device.
+pub const S_IFIFO: u32 = 0o010000;
+/// Character device.
+pub const S_IFCHR: u32 = 0o020000;
+/// Directory.
+pub const S_IFDIR: u32 = 0o040000;
+/// QNX named special file (semaphores / shared memory names).
+pub const S_IFNAM: u32 = 0o050000;
+/// Block device.
+pub const S_IFBLK: u32 = 0o060000;
+/// Regular file.
+pub const S_IFREG: u32 = 0o100000;
+/// Symbolic link.
+pub const S_IFLNK: u32 = 0o120000;
+/// Socket (defensive; not produced by `mkifs`).
+pub const S_IFSOCK: u32 = 0o140000;
+
+/// Image header flags.
+pub mod image_flags {
+    /// Header, trailer and dirents are stored in big endian format.
+    pub const BIGENDIAN: u8 = 0x01;
+    /// The image filesystem is read only (rom/flash).
+    pub const READONLY: u8 = 0x02;
+    /// Inode bits are valid.
+    pub const INO_BITS: u8 = 0x04;
+}
+
+/// Byte size of the fixed part of the image header (mountpoint follows).
+pub(crate) const IMAGE_HEADER_SIZE: usize = 88;
+
+/// Common directory entry attributes (`struct image_attr`), 24 bytes.
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Debug)]
+#[repr(C, packed)]
+struct AttrBytes<O: ByteOrder> {
+    size: U16<O>,
+    extattr_offset: U16<O>,
+    ino: U32<O>,
+    mode: U32<O>,
+    gid: U32<O>,
+    uid: U32<O>,
+    mtime: U32<O>,
+}
+
+/// Type specific fields of a regular file dirent (`struct image_file`).
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Debug)]
+#[repr(C, packed)]
+struct FileExtraBytes<O: ByteOrder> {
+    offset: U32<O>,
+    size: U32<O>,
+}
+
+/// Type specific fields of a symlink dirent (`struct image_symlink`).
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Debug)]
+#[repr(C, packed)]
+struct SymlinkExtraBytes<O: ByteOrder> {
+    sym_offset: U16<O>,
+    sym_size: U16<O>,
+}
+
+/// Type specific fields of a device dirent (`struct image_device`).
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Debug)]
+#[repr(C, packed)]
+struct DeviceExtraBytes<O: ByteOrder> {
+    dev: U32<O>,
+    rdev: U32<O>,
+}
+
+/// Image filesystem header (`struct image_header`).
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Debug)]
+#[repr(C, packed)]
+struct ImageHeaderBytes<O: ByteOrder> {
+    signature: [u8; 7],
+    flags: u8,
+    image_size: U32<O>,
+    hdr_dir_size: U32<O>,
+    dir_offset: U32<O>,
+    boot_ino: [U32<O>; 4],
+    script_ino: U32<O>,
+    chain_paddr: U32<O>,
+    spare: [U32<O>; 10],
+    mountflags: U32<O>,
+    // A NUL terminated `mountpoint` string follows the fixed fields.
+}
+
+/// Parsed image filesystem header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageHeader {
+    /// Size from the header to the end of the image trailer.
+    pub image_size: usize,
+    /// Size from the header to the last directory entry.
+    pub hdr_dir_size: usize,
+    /// Offset from the header to the first directory entry.
+    pub dir_offset: usize,
+    /// Inodes of the bootstrap programs.
+    pub boot_ino: [u32; 4],
+    /// Inode of the startup script.
+    pub script_ino: u32,
+    /// Physical address of a chained image filesystem.
+    pub chain_paddr: u32,
+    /// Default mount flags.
+    pub mountflags: u32,
+    /// Plain flags bytes of the header.
+    pub flags: u8,
+    /// Default mountpoint of the image filesystem.
+    pub mountpoint: String,
+}
+
+/// A single entry of the image filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// Stored entry path, without a leading slash.
+    pub path: String,
+    /// Entry payload.
+    pub kind: EntryKind,
+    /// Inode number (zero is used by `mkifs` for entries without inode).
+    pub ino: u32,
+    /// Raw mode bits, including the file type bits.
+    pub mode: u32,
+    /// Unix user id.
+    pub uid: u32,
+    /// Unix group id (note: stored before `uid` on disk).
+    pub gid: u32,
+    /// Modification time, unix epoch seconds.
+    pub mtime: u32,
+    /// Offset of extended attribute data, zero if none.
+    pub extattr_offset: u16,
+}
+
+/// The type specific payload of a directory entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryKind {
+    /// Directory.
+    Dir,
+    /// Regular file; contents start `offset` bytes after the image header.
+    File {
+        /// Offset from the image header to the file contents.
+        offset: usize,
+        /// File content size.
+        size: usize,
+    },
+    /// Symbolic link.
+    Symlink {
+        /// Symlink target string.
+        target: String,
+    },
+    /// Character device node.
+    Char {
+        /// Packed device id.
+        dev: u32,
+        /// Real device id.
+        rdev: u32,
+    },
+    /// Block device node.
+    Block {
+        /// Packed device id.
+        dev: u32,
+        /// Real device id.
+        rdev: u32,
+    },
+    /// Named pipe.
+    Fifo {
+        /// Packed device id.
+        dev: u32,
+        /// Real device id.
+        rdev: u32,
+    },
+    /// QNX named special file (semaphore or shared memory name).
+    Named {
+        /// Named special id.
+        dev: u32,
+        /// Real device id.
+        rdev: u32,
+    },
+    /// Socket.
+    Socket {
+        /// Packed device id.
+        dev: u32,
+        /// Real device id.
+        rdev: u32,
+    },
+}
+
+impl Entry {
+    /// Permission bits (`mode & 07777`).
+    pub const fn permissions(&self) -> u32 {
+        self.mode & 0o7777
+    }
+}
+
+/// Cast a byte order dependent structure out of a byte slice prefix.
+fn cast_prefix<T>(bytes: &[u8], err: Error) -> Result<&T, Error>
+where
+    T: FromBytes + KnownLayout + Immutable,
+{
+    T::ref_from_prefix(bytes).map(|(t, _)| t).map_err(|_| err)
+}
+
+/// Parse the common attributes of a dirent.
+fn parse_attr(dirent: &[u8], endian: Endian) -> Result<AttrParsed, Error> {
+    match endian {
+        Endian::Little => {
+            let attr = cast_prefix::<AttrBytes<LE>>(dirent, Error::BadDirent)?;
+            Ok(AttrParsed::from_bytes(attr))
+        }
+        Endian::Big => {
+            let attr = cast_prefix::<AttrBytes<BE>>(dirent, Error::BadDirent)?;
+            Ok(AttrParsed::from_bytes(attr))
+        }
+    }
+}
+
+/// Byte order independent copy of `struct image_attr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttrParsed {
+    extattr_offset: u16,
+    ino: u32,
+    mode: u32,
+    gid: u32,
+    uid: u32,
+    mtime: u32,
+}
+
+impl AttrParsed {
+    const fn from_bytes<O: ByteOrder>(raw: &AttrBytes<O>) -> Self {
+        Self {
+            extattr_offset: raw.extattr_offset.get(),
+            ino: raw.ino.get(),
+            mode: raw.mode.get(),
+            gid: raw.gid.get(),
+            uid: raw.uid.get(),
+            mtime: raw.mtime.get(),
+        }
+    }
+
+    const fn entry_common(self, path: String, kind: EntryKind) -> Entry {
+        Entry {
+            path,
+            kind,
+            ino: self.ino,
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            mtime: self.mtime,
+            extattr_offset: self.extattr_offset,
+        }
+    }
+}
+
+/// Scan `data` for the `"imagefs"` signature.
+///
+/// Returns the offset of the first match, if any.
+pub fn find_image_header(data: &[u8]) -> Option<usize> {
+    if data.len() < IMAGE_SIGNATURE.len() {
+        return None;
+    }
+    for off in 0..=(data.len() - IMAGE_SIGNATURE.len()) {
+        if &data[off..off + IMAGE_SIGNATURE.len()] == IMAGE_SIGNATURE {
+            return Some(off);
+        }
+    }
+    None
+}
+
+/// Parse the image filesystem header at `offset`.
+///
+/// The byte order comes from the `IMAGE_FLAGS_BIGENDIAN` flag byte; the
+/// mountpoint string follows the fixed fields.
+pub fn parse_image_header(data: &[u8], offset: usize) -> Result<(ImageHeader, Endian), Error> {
+    let bytes = data.get(offset..).ok_or(Error::BadOffset)?;
+    if bytes.len() < IMAGE_HEADER_SIZE {
+        return Err(Error::Truncated);
+    }
+
+    // The flags byte is endian neutral and selects the byte order of the rest.
+    let endian = Endian::from_image_flags(bytes[7]);
+    let (image_size, hdr_dir_size, dir_offset, boot_ino, script_ino, chain_paddr, mountflags) =
+        match endian {
+            Endian::Little => {
+                let (raw, _) = ImageHeaderBytes::<LE>::ref_from_prefix(bytes)
+                    .map_err(|_| Error::BadImageHeader)?;
+                if &raw.signature != IMAGE_SIGNATURE {
+                    return Err(Error::BadImageHeader);
+                }
+                header_fixed_fields(raw)
+            }
+            Endian::Big => {
+                let (raw, _) = ImageHeaderBytes::<BE>::ref_from_prefix(bytes)
+                    .map_err(|_| Error::BadImageHeader)?;
+                if &raw.signature != IMAGE_SIGNATURE {
+                    return Err(Error::BadImageHeader);
+                }
+                header_fixed_fields(raw)
+            }
+        };
+
+    // The mountpoint is a NUL terminated string bounded by the dirent area.
+    let mountpoint_end = if dir_offset > IMAGE_HEADER_SIZE && dir_offset <= bytes.len() {
+        dir_offset
+    } else {
+        bytes.len()
+    };
+    let mountpoint = read_cstring(&bytes[IMAGE_HEADER_SIZE..mountpoint_end]);
+
+    let header = ImageHeader {
+        image_size,
+        hdr_dir_size,
+        dir_offset,
+        boot_ino,
+        script_ino,
+        chain_paddr,
+        mountflags,
+        flags: bytes[7],
+        mountpoint,
+    };
+    Ok((header, endian))
+}
+
+/// The signature must have been verified by the caller.
+const fn header_fixed_fields<O: ByteOrder>(
+    raw: &ImageHeaderBytes<O>,
+) -> (usize, usize, usize, [u32; 4], u32, u32, u32) {
+    (
+        raw.image_size.get() as usize,
+        raw.hdr_dir_size.get() as usize,
+        raw.dir_offset.get() as usize,
+        [
+            raw.boot_ino[0].get(),
+            raw.boot_ino[1].get(),
+            raw.boot_ino[2].get(),
+            raw.boot_ino[3].get(),
+        ],
+        raw.script_ino.get(),
+        raw.chain_paddr.get(),
+        raw.mountflags.get(),
+    )
+}
+
+/// Validate the sizes recorded in an image filesystem header:
+///
+/// * `dir_offset` must be at least the fixed header size and not exceed
+///   `hdr_dir_size`
+/// * `hdr_dir_size` must not exceed `image_size - trailer`
+/// * the whole image must fit inside the available bytes
+pub(crate) fn validate_image_header(
+    slice: &[u8],
+    header_offset: usize,
+    header: &ImageHeader,
+) -> Result<(), Error> {
+    let available = slice
+        .len()
+        .checked_sub(header_offset)
+        .ok_or(Error::BadOffset)?;
+    if header.dir_offset < IMAGE_HEADER_SIZE
+        || header.dir_offset > header.hdr_dir_size
+        || header.image_size < header.hdr_dir_size.saturating_add(4)
+        || header.image_size > available
+    {
+        return Err(Error::BadImageHeader);
+    }
+    Ok(())
+}
+
+/// Walk the flat directory entry chain beginning at `dir_pos`.
+///
+/// `base` is the offset of the image header within `data`; a zero size
+/// entry ends the chain and every entry must lie inside `data`.
+pub fn parse_dirents(
+    data: &[u8],
+    base: usize,
+    dir_pos: usize,
+    endian: Endian,
+) -> Result<Vec<Entry>, Error> {
+    parse_dirents_bounded(data, base, dir_pos, data.len(), data.len(), endian)
+}
+
+/// Walk the dirent chain with explicit bounds.
+///
+/// The chain must end with a zero size entry at or before `dir_end`
+/// (the end of the image directory area), and referenced file contents
+/// must end at or before `data_end`.
+pub(crate) fn parse_dirents_bounded(
+    data: &[u8],
+    base: usize,
+    dir_pos: usize,
+    dir_end: usize,
+    data_end: usize,
+    endian: Endian,
+) -> Result<Vec<Entry>, Error> {
+    let mut entries = Vec::new();
+    let mut pos = dir_pos;
+
+    loop {
+        // Only two bytes are required to detect the terminator: mkifs
+        // reserves four, but the stored entry is a zero `u16` size.
+        let header_end = pos.checked_add(2).ok_or(Error::UnterminatedDirents)?;
+        if header_end > dir_end || header_end > data_end {
+            return Err(Error::UnterminatedDirents);
+        }
+        let size_bytes = data
+            .get(pos..header_end)
+            .ok_or(Error::UnterminatedDirents)?;
+        let size = match endian {
+            Endian::Little => u16::from_le_bytes([size_bytes[0], size_bytes[1]]),
+            Endian::Big => u16::from_be_bytes([size_bytes[0], size_bytes[1]]),
+        } as usize;
+
+        if size == 0 {
+            return Ok(entries);
+        }
+        if size < 24 {
+            return Err(Error::BadDirent);
+        }
+        let end = pos.checked_add(size).ok_or(Error::BadDirent)?;
+        if end > dir_end || end > data_end {
+            return Err(Error::BadDirent);
+        }
+        let dirent = data.get(pos..end).ok_or(Error::BadDirent)?;
+        let attr = parse_attr(&dirent[..24], endian)?;
+
+        // The kernel skips entries whose inode is zero (sys/image.h).
+        if attr.ino == 0 {
+            pos = end;
+            continue;
+        }
+
+        let entry = match attr.mode & S_IFMT {
+            S_IFREG => parse_file_entry(data, base, dirent, &attr, endian, data_end)?,
+            S_IFDIR => parse_dir_entry(dirent, &attr),
+            S_IFLNK => parse_symlink_entry(dirent, &attr, endian)?,
+            S_IFCHR | S_IFBLK | S_IFIFO | S_IFNAM | S_IFSOCK => {
+                parse_device_entry(dirent, &attr, endian)?
+            }
+            _ => return Err(Error::UnknownDirentType),
+        };
+        entries.push(entry);
+        pos = end;
+    }
+}
+
+/// Read the type specific fields of a file dirent in byte order `O`.
+fn file_extra_fields<O: ByteOrder>(bytes: &[u8]) -> Result<(usize, usize), Error> {
+    let extra = cast_prefix::<FileExtraBytes<O>>(bytes, Error::BadDirent)?;
+    Ok((extra.offset.get() as usize, extra.size.get() as usize))
+}
+
+/// Read the type specific fields of a symlink dirent in byte order `O`.
+fn symlink_extra_fields<O: ByteOrder>(bytes: &[u8]) -> Result<(usize, usize), Error> {
+    let extra = cast_prefix::<SymlinkExtraBytes<O>>(bytes, Error::BadDirent)?;
+    Ok((
+        extra.sym_offset.get() as usize,
+        extra.sym_size.get() as usize,
+    ))
+}
+
+/// Read the type specific fields of a device dirent in byte order `O`.
+fn device_extra_fields<O: ByteOrder>(bytes: &[u8]) -> Result<(u32, u32), Error> {
+    let extra = cast_prefix::<DeviceExtraBytes<O>>(bytes, Error::BadDirent)?;
+    Ok((extra.dev.get(), extra.rdev.get()))
+}
+
+/// Read a NUL terminated string from a bounded slice.
+///
+/// Strings without a NUL in the bound are returned up to the bound;
+/// invalid UTF-8 is replaced.
+fn read_cstring(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Parse a `S_IFREG` directory entry.
+fn parse_file_entry(
+    data: &[u8],
+    base: usize,
+    dirent: &[u8],
+    attr: &AttrParsed,
+    endian: Endian,
+    data_end: usize,
+) -> Result<Entry, Error> {
+    // attr (24) + offset (4) + size (4), path may be empty.
+    if dirent.len() < 32 {
+        return Err(Error::BadDirent);
+    }
+    let (offset, size) = match endian {
+        Endian::Little => file_extra_fields::<LE>(&dirent[24..])?,
+        Endian::Big => file_extra_fields::<BE>(&dirent[24..])?,
+    };
+    let path = read_cstring(&dirent[32..]);
+
+    // File contents must lie inside the image data.
+    let abs = base
+        .checked_add(offset)
+        .and_then(|abs| abs.checked_add(size))
+        .ok_or(Error::BadOffset)?;
+    if abs > data_end || abs > data.len() {
+        return Err(Error::BadOffset);
+    }
+
+    Ok(attr.entry_common(path, EntryKind::File { offset, size }))
+}
+
+/// Parse a `S_IFDIR` directory entry.
+fn parse_dir_entry(dirent: &[u8], attr: &AttrParsed) -> Entry {
+    // attr (24) followed by the NUL terminated path.
+    if dirent.len() >= 25 {
+        attr.entry_common(read_cstring(&dirent[24..]), EntryKind::Dir)
+    } else {
+        attr.entry_common(String::new(), EntryKind::Dir)
+    }
+}
+
+/// Parse a `S_IFLNK` directory entry.
+///
+/// `sym_offset` is relative to the `path` field at offset 28; the target
+/// of `sym_size` bytes follows the path inline.
+fn parse_symlink_entry(dirent: &[u8], attr: &AttrParsed, endian: Endian) -> Result<Entry, Error> {
+    // attr (24) + sym_offset (2) + sym_size (2) + path + target.
+    if dirent.len() < 28 {
+        return Err(Error::BadDirent);
+    }
+    let (sym_offset, sym_size) = match endian {
+        Endian::Little => symlink_extra_fields::<LE>(&dirent[24..])?,
+        Endian::Big => symlink_extra_fields::<BE>(&dirent[24..])?,
+    };
+
+    let path_end = 28usize.checked_add(sym_offset).ok_or(Error::BadDirent)?;
+    let path = read_cstring(dirent.get(28..path_end).ok_or(Error::BadDirent)?);
+
+    let target = if sym_size == 0 {
+        String::new()
+    } else {
+        let target_end = path_end.checked_add(sym_size).ok_or(Error::BadDirent)?;
+        let target_bytes = dirent.get(path_end..target_end).ok_or(Error::BadDirent)?;
+        read_cstring(target_bytes)
+    };
+
+    Ok(attr.entry_common(path, EntryKind::Symlink { target }))
+}
+
+/// Parse a device type directory entry (char/block/fifo/named/socket).
+fn parse_device_entry(dirent: &[u8], attr: &AttrParsed, endian: Endian) -> Result<Entry, Error> {
+    // attr (24) + dev (4) + rdev (4), followed by the path.
+    if dirent.len() < 32 {
+        return Err(Error::BadDirent);
+    }
+    let (dev, rdev) = match endian {
+        Endian::Little => device_extra_fields::<LE>(&dirent[24..])?,
+        Endian::Big => device_extra_fields::<BE>(&dirent[24..])?,
+    };
+
+    let kind = match attr.mode & S_IFMT {
+        S_IFCHR => EntryKind::Char { dev, rdev },
+        S_IFBLK => EntryKind::Block { dev, rdev },
+        S_IFNAM => EntryKind::Named { dev, rdev },
+        S_IFSOCK => EntryKind::Socket { dev, rdev },
+        _ => EntryKind::Fifo { dev, rdev },
+    };
+    Ok(attr.entry_common(read_cstring(&dirent[32..]), kind))
+}
