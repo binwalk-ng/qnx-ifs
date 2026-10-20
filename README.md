@@ -99,9 +99,11 @@ behaviour only where that is also the safest choice:
   end where their formats do: zlib stops at the stream end, LZO at its
   zero-length terminator, and UCL rejects trailing data after the end
   marker.
-- Trailer checksums are recomputed in pure Rust from the image's own
-  byte order (the reference tool's big-endian display is unreliable);
-  callers decide whether a mismatch is fatal.
+- Trailer checksums are recomputed in pure Rust, summing 32-bit words
+  and negating in the byte order of the structure the trailer belongs to
+  (the image filesystem header for `image_checksum`, the startup header
+  for `startup_checksum`); the reference tool's big-endian display is
+  unreliable. Callers decide whether a mismatch is fatal.
 
 ### Features
 
