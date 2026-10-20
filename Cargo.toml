@@ -9,6 +9,8 @@ rust-version = "1.88"
 description = "Pure-Rust parser and decompressor for QNX IFS (Image File System) firmware images"
 keywords = ["qnx", "firmware", "ifs", "parser", "security"]
 categories = ["parser-implementations", "filesystem", "security"]
+# Ship only crate content; CI housekeeping stays in the repository.
+exclude = [".github", ".gitignore"]
 
 [lints.clippy]
 redundant_type_annotations = "warn"
