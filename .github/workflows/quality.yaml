@@ -76,3 +76,21 @@ jobs:
 
       - name: Tests
         run: cargo test ${{ matrix.args }}
+
+  fuzzing:
+    name: Fuzzing harness
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Formatting (rustfmt)
+        run: cargo fmt --manifest-path fuzzing/Cargo.toml -- --check
+
+      - name: Clippy (all features)
+        run: cargo clippy --manifest-path fuzzing/Cargo.toml --all-targets --all-features -- -D warnings
+
+      - name: Clippy (no default features)
+        run: cargo clippy --manifest-path fuzzing/Cargo.toml --all-targets --no-default-features -- -D warnings

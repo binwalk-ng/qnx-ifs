@@ -8,472 +8,25 @@
 //! error cases.
 #![allow(clippy::panic)] // test assertions panic by design
 
-use qnx_ifs::{Endian, Entry, EntryKind, Error, Image};
+use common::fixtures::*;
+use qnx_ifs::{Endian, EntryKind, Error, Image};
 
 mod common;
 
-/// Byte order helper for building raw structures.
-#[derive(Clone, Copy)]
-struct E {
-    be: bool,
-}
-
-impl E {
-    const LE: Self = Self { be: false };
-    const BE: Self = Self { be: true };
-
-    const fn u16(self, value: u16) -> [u8; 2] {
-        if self.be {
-            value.to_be_bytes()
-        } else {
-            value.to_le_bytes()
-        }
+/// Compression variants available under the enabled features.
+fn compression_cases() -> Vec<TestCompress> {
+    #[allow(unused_mut)] // no pushes when every decoder feature is disabled
+    let mut cases = vec![TestCompress::None];
+    #[cfg(feature = "zlib")]
+    {
+        cases.push(TestCompress::Zlib);
+        cases.push(TestCompress::Gzip);
     }
-
-    const fn u32(self, value: u32) -> [u8; 4] {
-        if self.be {
-            value.to_be_bytes()
-        } else {
-            value.to_le_bytes()
-        }
-    }
-}
-
-/// Compression variants exercised by the fixture builder.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // variants are conditionally compiled with their feature
-enum TestCompress {
-    None,
-    Zlib,
-    Gzip,
-    Lzo,
-    Ucl,
-}
-
-const fn align4(value: usize) -> usize {
-    value.div_ceil(4) * 4
-}
-
-const fn align8(value: usize) -> usize {
-    value.div_ceil(8) * 8
-}
-
-/// Build the 256 byte startup header (64 fixed bytes plus zeroed
-/// `info[48]`), using the byte order selected by `endian`.
-fn startup_header(
-    endian: E,
-    flags1: u8,
-    header_size: usize,
-    startup_size: usize,
-    stored_size: usize,
-    imagefs_size: usize,
-) -> Vec<u8> {
-    let mut header = Vec::with_capacity(256);
-    if endian.be {
-        header.extend_from_slice(&[0x00, 0xFF, 0x7E, 0xEB]);
-    } else {
-        header.extend_from_slice(&[0xEB, 0x7E, 0xFF, 0x00]);
-    }
-    header.extend_from_slice(&endian.u16(1)); // version
-    header.push(flags1);
-    header.push(0); // flags2
-    header.extend_from_slice(&endian.u16(header_size as u16));
-    header.extend_from_slice(&endian.u16(1)); // machine (x86pc)
-    header.extend_from_slice(&endian.u32(0x0010_0000)); // startup_vaddr
-    header.extend_from_slice(&endian.u32(0)); // paddr_bias
-    header.extend_from_slice(&endian.u32(0x0010_0000)); // image_paddr
-    header.extend_from_slice(&endian.u32(0x0010_0000)); // ram_paddr
-    header.extend_from_slice(&endian.u32(0x1000)); // ram_size
-    header.extend_from_slice(&endian.u32(startup_size as u32));
-    header.extend_from_slice(&endian.u32(stored_size as u32));
-    header.extend_from_slice(&endian.u32(0)); // imagefs_paddr
-    header.extend_from_slice(&endian.u32(imagefs_size as u32));
-    header.extend_from_slice(&endian.u16(0)); // preboot_size
-    header.extend_from_slice(&[0u8; 14]); // zero0 + zero[3]
-    assert_eq!(header.len(), 64);
-    header.extend(std::iter::repeat_n(0u8, 192)); // info[48]
-    assert_eq!(header.len(), 256);
-    header
-}
-
-/// Build the image filesystem header (`struct image_header`) including
-/// the mountpoint string and its padding.
-fn image_header(
-    endian: E,
-    image_size: usize,
-    hdr_dir_size: usize,
-    dir_offset: usize,
-    mountpoint: &str,
-) -> Vec<u8> {
-    let mut header = Vec::new();
-    header.extend_from_slice(b"imagefs");
-    header.push(if endian.be { 0x01 } else { 0x00 });
-    header.extend_from_slice(&endian.u32(image_size as u32));
-    header.extend_from_slice(&endian.u32(hdr_dir_size as u32));
-    header.extend_from_slice(&endian.u32(dir_offset as u32));
-    for _ in 0..4 {
-        header.extend_from_slice(&endian.u32(0)); // boot_ino
-    }
-    header.extend_from_slice(&endian.u32(0)); // script_ino
-    header.extend_from_slice(&endian.u32(0)); // chain_paddr
-    for _ in 0..10 {
-        header.extend_from_slice(&endian.u32(0)); // spare
-    }
-    header.extend_from_slice(&endian.u32(0)); // mountflags
-    header.extend_from_slice(mountpoint.as_bytes());
-    header.push(0);
-    let aligned = align4(header.len());
-    header.resize(aligned, 0);
-    header
-}
-
-/// Build the 24 byte `struct image_attr`.
-fn attr(endian: E, size: u16, ino: u32, mode: u32) -> Vec<u8> {
-    let mut value = Vec::with_capacity(24);
-    value.extend_from_slice(&endian.u16(size));
-    value.extend_from_slice(&endian.u16(0)); // extattr_offset
-    value.extend_from_slice(&endian.u32(ino));
-    value.extend_from_slice(&endian.u32(mode));
-    value.extend_from_slice(&endian.u32(0)); // gid
-    value.extend_from_slice(&endian.u32(0)); // uid
-    value.extend_from_slice(&endian.u32(1)); // mtime
-    value
-}
-
-/// Size a dirent will occupy, rounded up to four bytes.
-const fn dirent_size(kind_fixed: usize, path: &str, target: Option<&str>) -> usize {
-    let mut raw = kind_fixed + path.len() + 1;
-    if let Some(target) = target {
-        raw += target.len() + 1;
-    }
-    align4(raw)
-}
-
-/// Build one dirent: attr, type-specific fixed fields, path, optional
-/// inline symlink target, then padding to the recorded (rounded) size.
-fn dirent(
-    endian: E,
-    kind_fixed: usize,
-    extra: &[u8],
-    path: &str,
-    target: Option<&str>,
-    ino: u32,
-    mode: u32,
-) -> Vec<u8> {
-    let size = dirent_size(kind_fixed, path, target);
-    let mut value = Vec::with_capacity(size);
-    value.extend_from_slice(&attr(endian, size as u16, ino, mode));
-    value.extend_from_slice(extra);
-    value.extend_from_slice(path.as_bytes());
-    value.push(0);
-    if let Some(target) = target {
-        value.extend_from_slice(target.as_bytes());
-        value.push(0);
-    }
-    value.resize(size, 0);
-    value
-}
-
-fn file_extra(endian: E, offset: usize, size: usize) -> Vec<u8> {
-    let mut extra = Vec::new();
-    extra.extend_from_slice(&endian.u32(offset as u32));
-    extra.extend_from_slice(&endian.u32(size as u32));
-    extra
-}
-
-fn device_extra(endian: E, dev: u32, rdev: u32) -> Vec<u8> {
-    let mut extra = Vec::new();
-    extra.extend_from_slice(&endian.u32(dev));
-    extra.extend_from_slice(&endian.u32(rdev));
-    extra
-}
-
-const MOUNTPOINT: &str = "/fs";
-const SHELL: &[u8] = b"#!/bin/sh\n";
-const LINK_TARGET: &str = "/bin/sh";
-const LINK_PATH: &str = "bin/link";
-
-/// Fixed image header plus mountpoint for [`MOUNTPOINT`].
-const HEADER_LEN: usize = 92;
-/// Sum of all dirent sizes in [`build_filesystem`].
-const DIR_AREA: usize = 28 + 28 + 40 + 48 + 28 + 44 + 40 + 44 + 44 + 44;
-/// Start offset of each dirent, relative to the start of the dirent area,
-/// in the order produced by [`build_filesystem`].
-const ENTRY_OFFSETS: [usize; 10] = [0, 28, 56, 96, 144, 172, 216, 256, 300, 344];
-
-const FILE_INO: u32 = 11;
-const LINK_INO: u32 = 12;
-const CHAR_INO: u32 = 20;
-const BLOCK_INO: u32 = 21;
-const FIFO_INO: u32 = 22;
-const NAMED_INO: u32 = 23;
-const SOCKET_INO: u32 = 24;
-
-/// Build a synthetic image filesystem blob: header, dirent chain with a
-/// terminator, file contents and the image trailer.
-fn build_filesystem(endian: E) -> Vec<u8> {
-    let header_len = align4(88 + 1 + MOUNTPOINT.len());
-    assert_eq!(header_len, 92);
-
-    // Compute directory entry sizes first: the file entry needs the
-    // absolute (header relative) data offset.
-    let sizes = [
-        dirent_size(24, "", None),                     // root directory
-        dirent_size(24, "bin", None),                  // bin
-        dirent_size(32, "bin/sh", None),               // bin/sh
-        dirent_size(28, LINK_PATH, Some(LINK_TARGET)), // bin/link
-        dirent_size(24, "dev", None),                  // dev
-        dirent_size(32, "dev/console", None),
-        dirent_size(32, "dev/blk", None),
-        dirent_size(32, "dev/fifo", None),
-        dirent_size(32, "dev/name", None),
-        dirent_size(32, "dev/sock", None),
-    ];
-    let dir_area: usize = sizes.iter().sum();
-    assert_eq!(dir_area, DIR_AREA);
-    let mut cursor = 0;
-    for (size, expected) in sizes.iter().zip(ENTRY_OFFSETS) {
-        assert_eq!(cursor, expected);
-        cursor += size;
-    }
-    let data_offset = header_len + dir_area + 4;
-    let image_size = data_offset + SHELL.len() + 4;
-    let hdr_dir_size = header_len + dir_area + 4;
-
-    let mut filesystem = image_header(endian, image_size, hdr_dir_size, header_len, MOUNTPOINT);
-    let mut push = |entry: Vec<u8>| filesystem.extend_from_slice(&entry);
-
-    push(dirent(endian, 24, &[], "", None, 1, 0o040755));
-    push(dirent(endian, 24, &[], "bin", None, 10, 0o040755));
-    push(dirent(
-        endian,
-        32,
-        &file_extra(endian, data_offset, SHELL.len()),
-        "bin/sh",
-        None,
-        FILE_INO,
-        0o100755,
-    ));
-
-    // mkifs records the path length plus NUL in `sym_offset`, then
-    // stores the target inline after the path.
-    let sym_offset = (LINK_PATH.len() + 1) as u16;
-    let mut symlink_extra = Vec::new();
-    symlink_extra.extend_from_slice(&endian.u16(sym_offset));
-    symlink_extra.extend_from_slice(&endian.u16((LINK_TARGET.len() + 1) as u16));
-    push(dirent(
-        endian,
-        28,
-        &symlink_extra,
-        LINK_PATH,
-        Some(LINK_TARGET),
-        LINK_INO,
-        0o120777,
-    ));
-
-    push(dirent(endian, 24, &[], "dev", None, 13, 0o040755));
-    push(dirent(
-        endian,
-        32,
-        &device_extra(endian, 0x1234, 0x5678),
-        "dev/console",
-        None,
-        CHAR_INO,
-        0o020600,
-    ));
-    push(dirent(
-        endian,
-        32,
-        &device_extra(endian, 0x0102, 0x0304),
-        "dev/blk",
-        None,
-        BLOCK_INO,
-        0o060600,
-    ));
-    push(dirent(
-        endian,
-        32,
-        &device_extra(endian, 0, 0),
-        "dev/fifo",
-        None,
-        FIFO_INO,
-        0o010600,
-    ));
-    push(dirent(
-        endian,
-        32,
-        &device_extra(endian, 0xAAAA, 0xBBBB),
-        "dev/name",
-        None,
-        NAMED_INO,
-        0o050600,
-    ));
-    push(dirent(
-        endian,
-        32,
-        &device_extra(endian, 0, 0),
-        "dev/sock",
-        None,
-        SOCKET_INO,
-        0o140600,
-    ));
-
-    // A zero size entry terminates the chain; mkifs reserves four bytes.
-    filesystem.extend_from_slice(&[0u8; 4]);
-    assert_eq!(filesystem.len(), data_offset);
-
-    filesystem.extend_from_slice(SHELL);
-    filesystem.extend_from_slice(&[0u8; 4]); // image trailer
-    assert_eq!(filesystem.len(), image_size);
-    filesystem
-}
-
-/// Frame an LZO1X compressed blob as mkifs does: big-endian length
-/// followed by block data, terminated by a zero length.
-#[cfg(feature = "lzo")]
-fn lzo_frame(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for chunk in data.chunks(1024) {
-        let compressed = lzokay::compress::compress(chunk).expect("lzo compress");
-        assert!(compressed.len() <= u16::MAX as usize);
-        out.extend_from_slice(&(compressed.len() as u16).to_be_bytes());
-        out.extend_from_slice(&compressed);
-    }
-    out.extend_from_slice(&[0, 0]);
-    out
-}
-
-#[cfg(feature = "ucl")]
-fn ucl_frame(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for chunk in data.chunks(1024) {
-        let compressed = common::ucl_literal_block(chunk);
-        assert!(compressed.len() <= u16::MAX as usize);
-        out.extend_from_slice(&(compressed.len() as u16).to_be_bytes());
-        out.extend_from_slice(&compressed);
-    }
-    out.extend_from_slice(&[0, 0]);
-    out
-}
-
-#[cfg(feature = "zlib")]
-fn zlib_stream(data: &[u8]) -> Vec<u8> {
-    use std::io::Write;
-
-    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(data).expect("zlib write");
-    encoder.finish().expect("zlib finish")
-}
-
-#[cfg(feature = "zlib")]
-fn gzip_stream(data: &[u8]) -> Vec<u8> {
-    use std::io::Write;
-
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(data).expect("gzip write");
-    encoder.finish().expect("gzip finish")
-}
-
-/// Wrap a filesystem blob in a startup header and, when requested,
-/// compress it exactly like `mkifs` does.
-fn build_image(endian: E, compress: TestCompress) -> Vec<u8> {
-    let filesystem = build_filesystem(endian);
-    let startup_endian_flag = if endian.be { 0x02 } else { 0x00 };
-
-    let (compress_flag, payload, startup_size) = match compress {
-        TestCompress::None => {
-            let program = b"\x7fELF";
-            let startup_size = align8(256 + program.len());
-            let mut payload = program.to_vec();
-            payload.resize(startup_size - 256, 0);
-            payload.extend_from_slice(&filesystem);
-            (0x00, payload, startup_size)
-        }
-        TestCompress::Zlib => {
-            #[cfg(feature = "zlib")]
-            {
-                (0x04, zlib_stream(&filesystem), 260)
-            }
-            #[cfg(not(feature = "zlib"))]
-            {
-                let _ = &filesystem;
-                panic!("zlib feature disabled")
-            }
-        }
-        TestCompress::Gzip => {
-            #[cfg(feature = "zlib")]
-            {
-                (0x04, gzip_stream(&filesystem), 260)
-            }
-            #[cfg(not(feature = "zlib"))]
-            {
-                let _ = &filesystem;
-                panic!("zlib feature disabled")
-            }
-        }
-        TestCompress::Lzo => {
-            #[cfg(feature = "lzo")]
-            {
-                (0x08, lzo_frame(&filesystem), 260)
-            }
-            #[cfg(not(feature = "lzo"))]
-            {
-                let _ = &filesystem;
-                panic!("lzo feature disabled")
-            }
-        }
-        TestCompress::Ucl => {
-            #[cfg(feature = "ucl")]
-            {
-                (0x0c, ucl_frame(&filesystem), 260)
-            }
-            #[cfg(not(feature = "ucl"))]
-            {
-                let _ = &filesystem;
-                panic!("ucl feature disabled")
-            }
-        }
-    };
-
-    let stored_size = 256 + payload.len() + usize::from(compress != TestCompress::None) * 4;
-    let flags1 = startup_endian_flag | compress_flag;
-    let mut image = startup_header(
-        endian,
-        flags1,
-        256,
-        startup_size,
-        stored_size,
-        filesystem.len(),
-    );
-    if compress != TestCompress::None {
-        image.extend_from_slice(&[0u8; 4]); // startup trailer
-    }
-    image.extend_from_slice(&payload);
-    assert_eq!(image.len(), stored_size);
-    image
-}
-fn shell_entry<'a>(image: &'a Image<'_>) -> &'a Entry {
-    image
-        .entries
-        .iter()
-        .find(|entry| entry.path == "bin/sh")
-        .expect("bin/sh entry")
-}
-
-fn link_entry<'a>(image: &'a Image<'_>) -> &'a Entry {
-    image
-        .entries
-        .iter()
-        .find(|entry| entry.path == LINK_PATH)
-        .expect("symlink entry")
-}
-
-fn device_entry<'a>(image: &'a Image<'_>, path: &str) -> &'a Entry {
-    image
-        .entries
-        .iter()
-        .find(|entry| entry.path == path)
-        .unwrap_or_else(|| panic!("{path} entry"))
+    #[cfg(feature = "lzo")]
+    cases.push(TestCompress::Lzo);
+    #[cfg(feature = "ucl")]
+    cases.push(TestCompress::Ucl);
+    cases
 }
 
 #[test]
@@ -506,7 +59,7 @@ fn parses_uncompressed_le_image() {
     assert_eq!(shell.permissions(), 0o755);
 
     match &link_entry(&parsed).kind {
-        EntryKind::Symlink { target } => assert_eq!(target, LINK_TARGET),
+        EntryKind::Symlink { target, .. } => assert_eq!(target, LINK_TARGET),
         other => panic!("wrong kind: {other:?}"),
     }
 
@@ -562,7 +115,7 @@ fn parses_uncompressed_be_image() {
     assert_eq!(parsed.entries.len(), 10);
     assert_eq!(parsed.file_bytes(shell_entry(&parsed)).unwrap(), SHELL);
     match &link_entry(&parsed).kind {
-        EntryKind::Symlink { target } => assert_eq!(target, LINK_TARGET),
+        EntryKind::Symlink { target, .. } => assert_eq!(target, LINK_TARGET),
         other => panic!("wrong kind: {other:?}"),
     }
     assert!(matches!(
@@ -589,7 +142,7 @@ fn parses_zlib_compressed_image() {
     assert_eq!(parsed.entries.len(), 10);
     assert_eq!(parsed.file_bytes(shell_entry(&parsed)).unwrap(), SHELL);
     match &link_entry(&parsed).kind {
-        EntryKind::Symlink { target } => assert_eq!(target, LINK_TARGET),
+        EntryKind::Symlink { target, .. } => assert_eq!(target, LINK_TARGET),
         other => panic!("wrong kind: {other:?}"),
     }
 }
@@ -608,7 +161,7 @@ fn parses_lzo_compressed_image() {
     assert_eq!(parsed.entries.len(), 10);
     assert_eq!(parsed.file_bytes(shell_entry(&parsed)).unwrap(), SHELL);
     match &link_entry(&parsed).kind {
-        EntryKind::Symlink { target } => assert_eq!(target, LINK_TARGET),
+        EntryKind::Symlink { target, .. } => assert_eq!(target, LINK_TARGET),
         other => panic!("wrong kind: {other:?}"),
     }
 }
@@ -812,7 +365,7 @@ fn parses_gzip_compressed_image() {
     assert_eq!(parsed.entries.len(), 10);
     assert_eq!(parsed.file_bytes(shell_entry(&parsed)).unwrap(), SHELL);
     match &link_entry(&parsed).kind {
-        EntryKind::Symlink { target } => assert_eq!(target, LINK_TARGET),
+        EntryKind::Symlink { target, .. } => assert_eq!(target, LINK_TARGET),
         other => panic!("wrong kind: {other:?}"),
     }
 }
@@ -848,4 +401,392 @@ fn rejects_truncated_ucl_chunk_stream() {
     let stored_size = data.len() as u32;
     data[36..40].copy_from_slice(&stored_size.to_le_bytes());
     assert_eq!(Image::parse(&data).unwrap_err(), Error::Truncated);
+}
+
+#[test]
+fn parses_mountless_bare_imagefs() {
+    for endian in [E::LE, E::BE] {
+        let filesystem = build_mountless_filesystem(endian);
+        let parsed = Image::parse_imagefs(&filesystem).expect("parse");
+
+        assert!(parsed.startup.is_none());
+        assert_eq!(parsed.startup_offset, 0);
+        assert_eq!(parsed.image_header.dir_offset, 88);
+        // No room for a mountpoint string before the dirent area.
+        assert_eq!(parsed.image_header.mountpoint, "");
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.file_bytes(shell_entry(&parsed)).unwrap(), SHELL);
+        // The size is not padded to four bytes, so there is no computable
+        // filesystem checksum.
+        assert!(parsed.image_checksum().is_none());
+    }
+}
+
+#[test]
+fn mountpoint_scan_is_bounded_by_header_sizes() {
+    let mut filesystem = build_filesystem(E::LE);
+    // Inconsistent, attacker-controlled sizes: a huge `dir_offset` and a
+    // dirent area that ends exactly at the header. Remove the unpacked
+    // mountpoint's NUL terminator so an unbounded scan would continue
+    // into the first dirent (whose size byte is 0x1c followed by NUL).
+    filesystem[12..16].copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
+    filesystem[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+    filesystem[88..92].fill(b'A');
+
+    let (header, _) = qnx_ifs::parse_image_header(&filesystem, 0).expect("header");
+    assert_eq!(header.mountpoint, "AAAA");
+    assert!(Image::parse_imagefs(&filesystem).is_err());
+}
+
+#[test]
+fn bare_imagefs_takes_precedence_over_embedded_startup_header() {
+    let filesystem = build_filesystem(E::LE);
+    let mut data = filesystem.clone();
+    // Forge a structurally valid startup header after the filesystem.
+    // A whole-buffer-only search would adopt it and misparse the image;
+    // the bare filesystem at offset 0 takes precedence.
+    data.extend_from_slice(&startup_header(E::LE, 0x00, 256, 256, 300, 0));
+    data.extend_from_slice(b"LOOK-ALIKE-PAYLOAD");
+
+    let parsed = Image::parse(&data).expect("parse");
+    assert!(parsed.startup.is_none());
+    assert_eq!(parsed.entries.len(), 10);
+    assert_eq!(parsed.total_size(), filesystem.len());
+
+    // The standalone startup scanner is unaffected: it still finds the
+    // forged header when a caller asks for one explicitly.
+    assert!(qnx_ifs::find_startup_header(&data).is_some());
+}
+
+#[test]
+fn parses_uncompressed_image_with_boot_prefix() {
+    let mut container = vec![0x55u8; 0x40];
+    container.extend_from_slice(&build_image(E::LE, TestCompress::None));
+    let parsed = Image::parse(&container).expect("parse");
+
+    assert_eq!(parsed.startup_offset, 0x40);
+    assert_eq!(parsed.total_size(), container.len());
+    assert_eq!(parsed.entries.len(), 10);
+    assert_eq!(
+        parsed.startup_bytes().expect("startup bytes"),
+        b"\x7fELF\x00\x00\x00\x00"
+    );
+    assert_eq!(parsed.file_bytes(shell_entry(&parsed)).unwrap(), SHELL);
+}
+
+#[cfg(feature = "zlib")]
+#[test]
+fn parses_zlib_image_with_boot_prefix() {
+    let mut container = vec![0x55u8; 0x40];
+    container.extend_from_slice(&build_image(E::LE, TestCompress::Zlib));
+    let parsed = Image::parse(&container).expect("parse");
+
+    assert_eq!(parsed.startup_offset, 0x40);
+    assert_eq!(parsed.total_size(), container.len());
+    assert_eq!(parsed.entries.len(), 10);
+    assert_eq!(parsed.file_bytes(shell_entry(&parsed)).unwrap(), SHELL);
+}
+
+#[cfg(feature = "lzo")]
+#[test]
+fn parses_lzo_image_with_boot_prefix() {
+    let mut container = vec![0x55u8; 0x40];
+    container.extend_from_slice(&build_image(E::LE, TestCompress::Lzo));
+    let parsed = Image::parse(&container).expect("parse");
+
+    assert_eq!(parsed.startup_offset, 0x40);
+    assert_eq!(parsed.total_size(), container.len());
+    assert_eq!(parsed.entries.len(), 10);
+    assert_eq!(parsed.file_bytes(shell_entry(&parsed)).unwrap(), SHELL);
+}
+
+#[cfg(feature = "ucl")]
+#[test]
+fn parses_ucl_image_with_boot_prefix() {
+    let mut container = vec![0x55u8; 0x40];
+    container.extend_from_slice(&build_image(E::LE, TestCompress::Ucl));
+    let parsed = Image::parse(&container).expect("parse");
+
+    assert_eq!(parsed.startup_offset, 0x40);
+    assert_eq!(parsed.total_size(), container.len());
+    assert_eq!(parsed.entries.len(), 10);
+    assert_eq!(parsed.file_bytes(shell_entry(&parsed)).unwrap(), SHELL);
+}
+
+#[test]
+fn preserves_raw_path_bytes() {
+    let image_bytes = build_image(E::BE, TestCompress::None);
+    let parsed = Image::parse(&image_bytes).expect("parse");
+
+    let file = shell_entry(&parsed);
+    assert_eq!(file.path, "bin/sh");
+    assert_eq!(file.raw_path, b"bin/sh");
+
+    let link = link_entry(&parsed);
+    assert_eq!(link.raw_path, LINK_PATH.as_bytes());
+    match &link.kind {
+        EntryKind::Symlink { target, raw_target } => {
+            assert_eq!(target, LINK_TARGET);
+            assert_eq!(raw_target, LINK_TARGET.as_bytes());
+        }
+        other => panic!("wrong kind: {other:?}"),
+    }
+
+    // The root directory stores an empty path.
+    assert_eq!(parsed.entries[0].raw_path, b"");
+}
+
+#[test]
+fn preserves_non_utf8_raw_paths_and_targets() {
+    const RAW_PATH: &[u8] = b"bin/\xffsh";
+    const RAW_TARGET: &[u8] = b"/bin/\xfeh";
+
+    let dirent_size = align4(28 + RAW_PATH.len() + 1 + RAW_TARGET.len() + 1);
+    let header_len = HEADER_LEN; // empty mountpoint, padded to 92 bytes
+    let dir_area = dirent_size + 4; // plus the chain terminator
+    let image_size = header_len + dir_area + 4; // plus the image trailer
+
+    let mut filesystem = image_header(E::LE, image_size, header_len + dir_area, header_len, "");
+
+    let mut extra = Vec::new();
+    extra.extend_from_slice(&E::LE.u16((RAW_PATH.len() + 1) as u16));
+    extra.extend_from_slice(&E::LE.u16((RAW_TARGET.len() + 1) as u16));
+
+    let mut entry = attr(E::LE, dirent_size as u16, LINK_INO, 0o120777);
+    entry.extend_from_slice(&extra);
+    entry.extend_from_slice(RAW_PATH);
+    entry.push(0);
+    entry.extend_from_slice(RAW_TARGET);
+    entry.push(0);
+    entry.resize(dirent_size, 0);
+
+    filesystem.extend_from_slice(&entry);
+    filesystem.extend_from_slice(&[0u8; 4]); // chain terminator
+    filesystem.extend_from_slice(&[0u8; 4]); // image trailer
+    assert_eq!(filesystem.len(), image_size);
+
+    let parsed = Image::parse_imagefs(&filesystem).expect("parse");
+    assert_eq!(parsed.entries.len(), 1);
+
+    let entry = &parsed.entries[0];
+    assert_eq!(entry.raw_path, RAW_PATH);
+    assert_eq!(entry.path, String::from_utf8_lossy(RAW_PATH).as_ref());
+    match &entry.kind {
+        EntryKind::Symlink { target, raw_target } => {
+            assert_eq!(raw_target, RAW_TARGET);
+            assert_eq!(target, String::from_utf8_lossy(RAW_TARGET).as_ref());
+        }
+        other => panic!("wrong kind: {other:?}"),
+    }
+}
+
+#[test]
+fn image_data_conversions_preserve_bytes() {
+    for compress in compression_cases() {
+        let image_bytes = build_image(E::LE, compress);
+        let image = Image::parse(&image_bytes).expect("parse");
+        let expected = image.filesystem.as_slice().to_vec();
+
+        assert_eq!(&*image.filesystem, expected.as_slice());
+        assert_eq!(image.filesystem.as_ref(), expected.as_slice());
+
+        let owned: Vec<u8> = image.filesystem.into();
+        assert_eq!(owned, expected);
+    }
+}
+
+#[test]
+fn quarantines_zero_inode_dirents() {
+    let mut data = build_image(E::LE, TestCompress::None);
+    let fifo = 264 + HEADER_LEN + ENTRY_OFFSETS[7];
+    data[fifo + 4..fifo + 8].fill(0); // attr.ino of dev/fifo
+
+    let parsed = Image::parse(&data).expect("parse");
+    assert_eq!(parsed.entries.len(), 9);
+
+    // The skipped dirent is recorded, with its position relative to the
+    // image header, instead of being silently dropped.
+    assert_eq!(parsed.omitted_dirents.len(), 1);
+    let omitted = parsed.omitted_dirents[0];
+    assert_eq!(omitted.offset, HEADER_LEN + ENTRY_OFFSETS[7]);
+    assert_eq!(omitted.size, 44); // align4(32 + len("dev/fifo") + 1)
+    assert_eq!(omitted.mode, 0o010600);
+    assert_eq!(omitted.extattr_offset, 0);
+
+    // The same quarantine applies to bare filesystem parsing.
+    let mut filesystem = build_filesystem(E::LE);
+    dirent_ino_zero(&mut filesystem, ENTRY_OFFSETS[7]);
+    let bare = Image::parse_imagefs(&filesystem).expect("parse");
+    assert_eq!(bare.omitted_dirents.len(), 1);
+    assert_eq!(bare.omitted_dirents[0], omitted);
+}
+
+/// Zero the `ino` field of the dirent chain entry at `entry_offset`.
+fn dirent_ino_zero(filesystem: &mut [u8], entry_offset: usize) {
+    let start = HEADER_LEN + entry_offset + 4;
+    filesystem[start..start + 4].fill(0);
+}
+
+#[test]
+fn omitted_dirents_are_counted_up_to_cap() {
+    // Build a dirent chain of tiny zero-inode entries that exceeds the
+    // quarantine cap. Recording must stop at the cap; the chain walk and
+    // error behaviour must be unaffected.
+    const ENTRY_SIZE: usize = 28; // align4(24 + 1 + padding)
+    let count = qnx_ifs::MAX_OMITTED_DIRENTS + 3;
+
+    // The empty mountpoint in the helper pads to 92 bytes.
+    assert_eq!(HEADER_LEN, 92);
+    let dir_area = count * ENTRY_SIZE + 4; // plus the chain terminator
+    let image_size = HEADER_LEN + dir_area + 4;
+    let mut filesystem = image_header(E::LE, image_size, HEADER_LEN + dir_area, HEADER_LEN, "");
+    for _ in 0..count {
+        // A zero-inode directory entry with a one byte path.
+        let mut dirent_bytes = attr(E::LE, ENTRY_SIZE as u16, 0, 0o040755);
+        dirent_bytes.push(b'x');
+        dirent_bytes.push(0);
+        dirent_bytes.resize(ENTRY_SIZE, 0);
+        filesystem.extend_from_slice(&dirent_bytes);
+    }
+    filesystem.extend_from_slice(&[0u8; 4]); // dirent chain terminator
+    filesystem.extend_from_slice(&[0u8; 4]); // image trailer
+    assert_eq!(filesystem.len(), image_size);
+
+    let parsed = Image::parse_imagefs(&filesystem).expect("parse");
+    assert_eq!(parsed.entries.len(), 0);
+    assert_eq!(parsed.omitted_dirents.len(), qnx_ifs::MAX_OMITTED_DIRENTS);
+}
+
+#[test]
+fn image_checksums_verify_after_patch() {
+    for endian in [E::LE, E::BE] {
+        let mut image_bytes = build_image(endian, TestCompress::None);
+        let parsed = Image::parse(&image_bytes).expect("parse");
+        let trailer_at = parsed.header_offset + parsed.image_header.image_size - 4;
+
+        // The synthetic trailer is zeroed; the recomputation disagrees.
+        let first = parsed.image_checksum().expect("filesystem checksums");
+        assert!(!first.valid());
+
+        // Patch the stored value with the recomputation; both raw
+        // byte orders must verify after the patch.
+        image_bytes[trailer_at..trailer_at + 4].copy_from_slice(&endian.u32(first.computed));
+        let reparsed = Image::parse(&image_bytes).expect("parse");
+        let second = reparsed.image_checksum().expect("filesystem checksums");
+        assert!(second.valid());
+        assert_eq!(second.stored, first.computed);
+    }
+}
+
+#[test]
+fn startup_checksums_verify_after_patch() {
+    for endian in [E::LE, E::BE] {
+        for compress in compression_cases() {
+            let mut image_bytes = build_image(endian, compress);
+            let parsed = Image::parse(&image_bytes).expect("parse");
+
+            // The synthetic trailer is zeroed; the recomputation disagrees.
+            let first = parsed.startup_checksum().expect("startup checksums");
+            assert!(!first.valid());
+            let trailer_at = parsed.startup_offset + parsed.startup.unwrap().startup_size - 4;
+            image_bytes[trailer_at..trailer_at + 4].copy_from_slice(&endian.u32(first.computed));
+
+            let reparsed = Image::parse(&image_bytes).expect("parse");
+            let second = reparsed.startup_checksum().expect("startup checksums");
+            assert!(second.valid());
+            assert_eq!(second.stored, first.computed);
+        }
+    }
+}
+
+#[test]
+fn startup_checksum_uses_startup_byte_order() {
+    // Startup header little-endian, filesystem big-endian. The startup
+    // trailer checksum must follow the startup header's byte order, not
+    // the filesystem's.
+    let be_image = build_image(E::BE, TestCompress::None);
+    let filesystem = build_filesystem(E::BE);
+    let startup_size = 264;
+    let stored_size = 256 + 8 + filesystem.len();
+
+    let mut image_bytes = startup_header(
+        E::LE,
+        0x00,
+        startup_size,
+        startup_size,
+        stored_size,
+        filesystem.len(),
+    );
+    image_bytes.extend_from_slice(&be_image[256..]);
+
+    let parsed = Image::parse(&image_bytes).expect("parse");
+    assert_eq!(parsed.endian, Endian::Big);
+    assert_eq!(
+        parsed.startup.as_ref().expect("startup header").endian,
+        Endian::Little
+    );
+
+    let first = parsed.startup_checksum().expect("startup checksums");
+    let trailer_at = parsed.startup_offset + startup_size - 4;
+    image_bytes[trailer_at..trailer_at + 4].copy_from_slice(&first.computed.to_le_bytes());
+
+    let reparsed = Image::parse(&image_bytes).expect("parse");
+    let second = reparsed.startup_checksum().expect("startup checksums");
+    assert!(second.valid());
+    assert_eq!(second.stored, first.computed);
+}
+
+#[test]
+fn compressed_image_checksum_uses_decompressed_filesystem() {
+    let baseline_bytes = build_image(E::LE, TestCompress::None);
+    let baseline = Image::parse(&baseline_bytes).expect("parse");
+    let expected = baseline.image_checksum().expect("filesystem checksums");
+
+    for compress in compression_cases() {
+        let image_bytes = build_image(E::LE, compress);
+        let parsed = Image::parse(&image_bytes).expect("parse");
+        let checksums = parsed.image_checksum().expect("filesystem checksums");
+        // The fixtures leave the trailer zeroed; the covered region is the
+        // decompressed filesystem, so it must not depend on compression.
+        assert_eq!(checksums.stored, 0);
+        assert_eq!(checksums.computed, expected.computed);
+    }
+}
+
+#[test]
+fn lenient_options_accept_damaged_startup_header() {
+    let options = qnx_ifs::ParseOptions {
+        lenient_startup_header: true,
+        ..qnx_ifs::ParseOptions::default()
+    };
+
+    // Non-zero reserve fields only: the direct parser reports the zero
+    // field check, and whole-image parsing fails after the search finds
+    // no acceptable header. Lenient options accept and parse normally.
+    let mut data = build_image(E::LE, TestCompress::None);
+    data[50..64].fill(0xAA); // zero0 + zero[3]
+    assert!(matches!(
+        qnx_ifs::parse_startup_header(&data, 0),
+        Err(Error::BadStartupHeaderZeros)
+    ));
+    assert!(Image::parse(&data).is_err());
+    assert!(Image::parse_imagefs(&data).is_ok());
+    assert!(qnx_ifs::find_startup_header(&data).is_none());
+    let parsed = Image::parse_with_options(&data, &options).expect("lenient parse");
+    assert_eq!(parsed.entries.len(), 10);
+    assert_eq!(parsed.file_bytes(shell_entry(&parsed)).unwrap(), SHELL);
+
+    // A set reserved flags2 byte is also rejected strictly and accepted
+    // leniently.
+    let mut data = build_image(E::LE, TestCompress::None);
+    data[7] = 0x80; // flags2
+    assert!(matches!(
+        qnx_ifs::parse_startup_header(&data, 0),
+        Err(Error::BadStartupHeader)
+    ));
+    assert!(Image::parse(&data).is_err());
+    assert!(Image::parse_with_options(&data, &options).is_ok());
+
+    // Default options are strict, like `Image::parse`.
+    assert!(Image::parse_with_options(&data, &qnx_ifs::ParseOptions::default()).is_err());
 }

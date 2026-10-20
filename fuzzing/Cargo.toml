@@ -1,0 +1,14 @@
+[package]
+name = "fuzz"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+afl = "0.17"
+qnx-ifs = { path = "../" }
+
+[features]
+default = ["zlib", "lzo", "ucl"]
+zlib = ["qnx-ifs/zlib"]
+lzo = ["qnx-ifs/lzo"]
+ucl = ["qnx-ifs/ucl"]

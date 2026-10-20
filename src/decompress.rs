@@ -40,9 +40,17 @@ pub const BLOCK_MAX_OUTPUT: usize = 64 * 1024;
 ///
 /// [`Compress::None`] images carry the filesystem uncompressed; callers
 /// slice the region directly and must not invoke this for them.
+///
+/// The region is decompressed strictly within its declared extent: a zlib
+/// or gzip stream truncated by the end of the region is an error, and
+/// trailing bytes after a gzip member are rejected instead of being
+/// ignored like the reference tool does after `gzread` errors out. Bytes
+/// after the end of a zlib stream are not inspected by the decoder (zlib
+/// framing carries no region length), so the startup header's declared
+/// filesystem size remains the authoritative bound on the output.
 pub fn decompress_region(region: &[u8], kind: Compress, limits: &Limits) -> Result<Vec<u8>, Error> {
     match kind {
-        Compress::None => Err(Error::Decompress("region is not compressed")),
+        Compress::None => Err(Error::Decompress("region is not compressed".to_string())),
         Compress::Zlib => zlib_stream(region, limits),
         Compress::Lzo => lzo_chunks(region, limits),
         Compress::Ucl => ucl_chunks(region, limits),
@@ -71,7 +79,7 @@ fn zlib_stream(region: &[u8], limits: &Limits) -> Result<Vec<u8>, Error> {
         loop {
             let read = reader
                 .read(&mut chunk)
-                .map_err(|error| Error::Decompression(format!("zlib: {error}")))?;
+                .map_err(|error| Error::Decompress(format!("zlib: {error}")))?;
             if read == 0 {
                 break;
             }
@@ -109,7 +117,7 @@ fn lzo_chunks(region: &[u8], limits: &Limits) -> Result<Vec<u8>, Error> {
             let decoded = lzo::decompress(block, cap).map_err(|error| match error {
                 // Uniform with the UCL path and the global limit.
                 lzo::Error::OutputOverrun => Error::DecompressTooLarge,
-                other => Error::Decompression(format!("lzo: {other}")),
+                other => Error::Decompress(format!("lzo: {other}")),
             })?;
             if decoded.len() > budget_left || decoded.len() > BLOCK_MAX_OUTPUT {
                 return Err(Error::DecompressTooLarge);

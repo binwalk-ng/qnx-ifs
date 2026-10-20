@@ -28,13 +28,29 @@ pub const STARTUP_HEADER_SIZE: usize = 64;
 /// Returns `(offset, header)`. Every structural check (signature,
 /// version, zero fields) must pass.
 pub fn find_startup_header(data: &[u8]) -> Option<(usize, StartupHeader)> {
+    find_startup_header_lenient(data, false)
+}
+
+/// Scan the whole buffer for a startup header with relaxed validation.
+///
+/// With `lenient` set, the reserve-field and `flags2` checks are skipped,
+/// matching `dumpifs -z` for damaged or vendor-patched images. All other
+/// structural checks (signature, version, size relationships) still
+/// apply.
+pub fn find_startup_header_lenient(data: &[u8], lenient: bool) -> Option<(usize, StartupHeader)> {
     if data.len() < STARTUP_HEADER_SIZE {
         return None;
     }
     for off in 0..=data.len() - STARTUP_HEADER_SIZE {
+        // Both magic orientations start with a distinct first byte; a
+        // cheap compare filters the majority of offsets.
+        let first = data[off];
+        if first != STARTUP_MAGIC_LE[0] && first != STARTUP_MAGIC_BE[0] {
+            continue;
+        }
         let matches_magic =
             data[off..off + 4] == STARTUP_MAGIC_LE || data[off..off + 4] == STARTUP_MAGIC_BE;
-        if matches_magic && let Ok(hdr) = parse_startup_header(data, off) {
+        if matches_magic && let Ok(hdr) = parse_startup_header_opts(data, off, lenient) {
             return Some((off, hdr));
         }
     }
@@ -143,6 +159,17 @@ struct StartupHeaderBytes<O: ByteOrder> {
 
 /// Parse and validate the startup header at `offset`.
 pub fn parse_startup_header(data: &[u8], offset: usize) -> Result<StartupHeader, Error> {
+    parse_startup_header_opts(data, offset, false)
+}
+
+/// Parse and validate the startup header at `offset`, optionally
+/// relaxing the reserve-field and `flags2` checks (see
+/// [`crate::ParseOptions::lenient_startup_header`]).
+pub fn parse_startup_header_opts(
+    data: &[u8],
+    offset: usize,
+    lenient: bool,
+) -> Result<StartupHeader, Error> {
     let bytes = data.get(offset..).ok_or(Error::BadOffset)?;
     if bytes.len() < STARTUP_HEADER_SIZE {
         return Err(Error::Truncated);
@@ -160,26 +187,34 @@ pub fn parse_startup_header(data: &[u8], offset: usize) -> Result<StartupHeader,
         Endian::Little => {
             let (raw, _) = StartupHeaderBytes::<LE>::ref_from_prefix(bytes)
                 .map_err(|_| Error::BadStartupHeader)?;
-            build_startup_header(raw)?
+            build_startup_header(raw, lenient)?
         }
         Endian::Big => {
             let (raw, _) = StartupHeaderBytes::<BE>::ref_from_prefix(bytes)
                 .map_err(|_| Error::BadStartupHeader)?;
-            build_startup_header(raw)?
+            build_startup_header(raw, lenient)?
         }
     };
     Ok(hdr)
 }
 
 /// Convert a byte order specific raw header into the public, validated form.
-fn build_startup_header<O: ByteOrder>(raw: &StartupHeaderBytes<O>) -> Result<StartupHeader, Error> {
+///
+/// `lenient` skips the `zero0`/`zero[3]` reserve-field and `flags2`
+/// checks (the `dumpifs -z` behaviour) for damaged or vendor-patched
+/// images. Signature, version and the size relationships are always
+/// enforced.
+fn build_startup_header<O: ByteOrder>(
+    raw: &StartupHeaderBytes<O>,
+    lenient: bool,
+) -> Result<StartupHeader, Error> {
     if raw.version.get() != STARTUP_HDR_VERSION {
         return Err(Error::BadStartupHeader);
     }
-    if raw.flags2 != 0 {
+    if !lenient && raw.flags2 != 0 {
         return Err(Error::BadStartupHeader);
     }
-    if !raw.zeros.iter().all(|&b| b == 0) {
+    if !lenient && !raw.zeros.iter().all(|&b| b == 0) {
         return Err(Error::BadStartupHeaderZeros);
     }
     if (raw.header_size.get() as usize) < STARTUP_HEADER_SIZE {

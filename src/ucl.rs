@@ -18,6 +18,11 @@ use crate::error::Error;
 /// the final distance can reach `0x1000003`.
 const MAX_OFFSET_LIMIT: usize = 0x00ff_ffff + 3;
 
+/// Build an [`Error::Decompress`] with backend context.
+fn ucl_error(message: &'static str) -> Error {
+    Error::Decompress(message.to_string())
+}
+
 /// Decompress one NRV2B block from `input`, appending the result to `out`.
 ///
 /// `max_add` bounds how many bytes may be appended. On any error, `out` is
@@ -72,7 +77,7 @@ impl<'a> BitReader<'a> {
         let byte = *self
             .input
             .get(self.pos)
-            .ok_or(Error::Decompress("ucl: unexpected end of compressed block"))?;
+            .ok_or_else(|| ucl_error("ucl: unexpected end of compressed block"))?;
         self.pos += 1;
         Ok(byte)
     }
@@ -98,7 +103,7 @@ fn resolve_match_offset(
     let encoded = (offset_code - 3)
         .checked_mul(256)
         .and_then(|value| value.checked_add(low))
-        .ok_or(Error::Decompress("ucl: match offset overflow"))?;
+        .ok_or_else(|| ucl_error("ucl: match offset overflow"))?;
     if encoded == 0xffff_ffff {
         return Ok(None);
     }
@@ -130,9 +135,9 @@ fn decode_block(input: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<(), Err
             offset_code = offset_code
                 .checked_mul(2)
                 .and_then(|value| value.checked_add(bit))
-                .ok_or(Error::Decompress("ucl: match offset overflow"))?;
+                .ok_or_else(|| ucl_error("ucl: match offset overflow"))?;
             if offset_code > MAX_OFFSET_LIMIT {
-                return Err(Error::Decompress("ucl: match offset too large"));
+                return Err(ucl_error("ucl: match offset too large"));
             }
             if reader.bit()? == 1 {
                 break;
@@ -152,7 +157,7 @@ fn decode_block(input: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<(), Err
                 length = length
                     .checked_mul(2)
                     .and_then(|value| value.checked_add(bit))
-                    .ok_or(Error::Decompress("ucl: match length overflow"))?;
+                    .ok_or_else(|| ucl_error("ucl: match length overflow"))?;
                 if length > limit {
                     return Err(Error::DecompressTooLarge);
                 }
@@ -165,7 +170,7 @@ fn decode_block(input: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<(), Err
         length += usize::from(distance > 0x0d00);
 
         if distance == 0 || distance > out.len() {
-            return Err(Error::Decompress("ucl: match distance exceeds output"));
+            return Err(ucl_error("ucl: match distance exceeds output"));
         }
 
         // NRV2B copies the first match byte plus `length` additional bytes,
@@ -173,7 +178,7 @@ fn decode_block(input: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<(), Err
         // for run-length matches.
         let copy_len = length
             .checked_add(1)
-            .ok_or(Error::Decompress("ucl: match length overflow"))?;
+            .ok_or_else(|| ucl_error("ucl: match length overflow"))?;
         let end = out
             .len()
             .checked_add(copy_len)
@@ -190,7 +195,7 @@ fn decode_block(input: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<(), Err
     }
 
     if !reader.consumed() {
-        return Err(Error::Decompress("ucl: trailing data after end marker"));
+        return Err(ucl_error("ucl: trailing data after end marker"));
     }
     Ok(())
 }
