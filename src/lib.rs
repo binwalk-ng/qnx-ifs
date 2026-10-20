@@ -29,17 +29,30 @@
 //! - Startup header validation (`0x00FF7EEB` signature, version, and
 //!   zero-field checks), little- and big-endian images
 //! - Image filesystem header and dirent chain walking
-//!   (files, directories, symbolic links, and device nodes)
+//!   (files, directories, symbolic links, and device nodes); dirents the
+//!   kernel would skip (`ino == 0`) stay out of the entry list and are
+//!   reported in [`Image::omitted_dirents`]
 //! - Decompression of the compressed filesystem region according to
-//!   `startup_hdr.flags1`:
+//!   `startup_hdr.flags1`, bounded by the declared image extent:
 //!     - `0x04` zlib
 //!     - `0x08` LZO1X
 //!     - `0x0C` UCL NRV2B *(clean-room implementation)*
-//! - An in-memory entry model
+//! - An in-memory entry model, including raw stored path bytes for
+//!   byte-exact extraction of non-UTF-8 names
 //!
 //! This crate performs **no filesystem I/O**. Writing entries to disk
 //! (path sanitization, symlink handling, permissions, timestamps) is
 //! intentionally left to callers.
+//!
+//! ## Parsing policy
+//!
+//! Parsing mirrors the reference `dumpifs` tool where that is also the
+//! defensive choice: a bare `imagefs` filesystem at the very start of the
+//! input takes precedence over a whole-buffer startup-header search, so
+//! embedded look-alike data deeper in the image cannot hijack the parse.
+//! Structural checks are strict by default; reserve-field leniency for
+//! damaged images (the `dumpifs -z` behaviour) is opt-in through
+//! [`ParseOptions::lenient_startup_header`].
 //!
 //! ## Licensing
 //!
@@ -54,8 +67,8 @@ pub mod ucl;
 
 pub use error::Error;
 pub use image::{
-    Entry, EntryKind, ImageHeader, find_image_header, parse_dirents, parse_image_header,
-    parse_image_header as parse_imagefs_header,
+    Entry, EntryKind, ImageHeader, MAX_OMITTED_DIRENTS, OmittedDirent, find_image_header,
+    parse_dirents, parse_image_header,
 };
 
 mod startup;
@@ -83,6 +96,67 @@ impl<'a> ImageData<'a> {
     }
 }
 
+impl std::ops::Deref for ImageData<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for ImageData<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl From<ImageData<'_>> for Vec<u8> {
+    fn from(value: ImageData<'_>) -> Self {
+        match value {
+            ImageData::Borrowed(borrowed) => borrowed.to_vec(),
+            ImageData::Owned(owned) => owned.into(),
+        }
+    }
+}
+
+/// Tunable parsing policy.
+///
+/// Parsing is defensive by default; every option here *relaxes* exactly
+/// one documented check, always opt-in.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ParseOptions {
+    /// Bounding decompression work.
+    pub limits: Limits,
+    /// Accept startup headers whose reserve fields (`zero0`/`zero[3]`)
+    /// are non-zero or whose reserved `flags2` byte is set — the
+    /// behaviour of `dumpifs -z`, for damaged or vendor-patched images.
+    ///
+    /// Strict validation (the default) rejects both. Signature, version
+    /// and size-relationship checks are never relaxed.
+    pub lenient_startup_header: bool,
+}
+
+/// Stored and recomputed trailer checksum pair.
+///
+/// The recomputation follows the reference tool's rule: sum the 32-bit
+/// words of the covered region (in the image's byte order) and negate.
+/// Avoids the reference tool's host-endian sloppiness on big-endian
+/// images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Checksums {
+    /// Value read from the trailer on disk.
+    pub stored: u32,
+    /// Value recomputed over the region the trailer vouches for.
+    pub computed: u32,
+}
+
+impl Checksums {
+    /// Whether the stored checksum matches the recomputation.
+    pub const fn valid(&self) -> bool {
+        self.stored == self.computed
+    }
+}
+
 /// A parsed QNX IFS image.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Image<'a> {
@@ -98,14 +172,18 @@ pub struct Image<'a> {
     pub startup_offset: usize,
     /// Offset of the image filesystem header within the filesystem data.
     ///
-    /// All offsets stored by [`Entry`] variants are relative to this.
+    /// All offsets stored by [`Entry`] and [`OmittedDirent`] are relative
+    /// to this.
     pub header_offset: usize,
     /// Parsed image filesystem header.
     pub image_header: ImageHeader,
     /// Byte order of the image filesystem structures.
     pub endian: Endian,
-    /// All directory entries.
+    /// All directory entries the kernel would mount.
     pub entries: Vec<Entry>,
+    /// Dirents skipped by the kernel's zero-inode rule, quarantined for
+    /// reporting instead of being silently dropped.
+    pub omitted_dirents: Vec<OmittedDirent>,
     /// Filesystem data: dirents and file contents live in this buffer.
     pub filesystem: ImageData<'a>,
     /// The complete input buffer; used to report startup program bytes.
@@ -113,10 +191,11 @@ pub struct Image<'a> {
 }
 
 impl<'a> Image<'a> {
-    /// Parse an IFS image with default [`Limits`].
+    /// Parse an IFS image with default [`ParseOptions`].
     ///
     /// The input may start with a startup header (bootable image) or be a
-    /// bare `imagefs` filesystem. Use [`Image::parse_imagefs`] when a bare
+    /// bare `imagefs` filesystem. A bare filesystem at the very start
+    /// takes precedence. Use [`Image::parse_imagefs`] when a bare
     /// filesystem may be preceded by unrelated bytes.
     pub fn parse(data: &'a [u8]) -> Result<Self, Error> {
         Self::parse_with_limits(data, &Limits::default())
@@ -132,10 +211,28 @@ impl<'a> Image<'a> {
     /// header; use [`Image::parse_imagefs_with_limits`] to search the
     /// whole input instead.
     pub fn parse_with_limits(data: &'a [u8], limits: &Limits) -> Result<Self, Error> {
-        let Some((startup_offset, startup)) = startup::find_startup_header(data) else {
-            if data.starts_with(image::IMAGE_SIGNATURE) {
-                return Self::parse_imagefs_with_limits(data, limits);
-            }
+        Self::parse_with_options(
+            data,
+            &ParseOptions {
+                limits: *limits,
+                lenient_startup_header: false,
+            },
+        )
+    }
+
+    /// Parse an IFS image with a fully specified [`ParseOptions`].
+    pub fn parse_with_options(data: &'a [u8], options: &ParseOptions) -> Result<Self, Error> {
+        // A bare `imagefs` filesystem at the very start takes precedence,
+        // mirroring the reference tool's first search step. This keeps the
+        // outcome deterministic: embedded startup-header look-alikes
+        // deeper in a bare filesystem cannot hijack the parse.
+        if data.starts_with(image::IMAGE_SIGNATURE) {
+            return Self::parse_imagefs_with_limits(data, &options.limits);
+        }
+
+        let Some((startup_offset, startup)) =
+            startup::find_startup_header_lenient(data, options.lenient_startup_header)
+        else {
             return Err(Error::BadStartupHeader);
         };
 
@@ -170,7 +267,8 @@ impl<'a> Image<'a> {
             }
             Compress::Zlib | Compress::Lzo | Compress::Ucl => {
                 let region = &data[startup_end..stored_end];
-                let mut decoded = decompress::decompress_region(region, startup.compress, limits)?;
+                let mut decoded =
+                    decompress::decompress_region(region, startup.compress, &options.limits)?;
                 if let Some(size) = declared_filesystem_size {
                     if decoded.len() < size {
                         return Err(Error::Truncated);
@@ -238,7 +336,7 @@ impl<'a> Image<'a> {
         let data_end = header_offset
             .checked_add(image_header.image_size)
             .ok_or(Error::BadOffset)?;
-        let entries = image::parse_dirents_bounded(
+        let (entries, omitted_dirents) = image::parse_dirents_bounded(
             slice,
             header_offset,
             dirent_start,
@@ -254,6 +352,7 @@ impl<'a> Image<'a> {
             image_header,
             endian,
             entries,
+            omitted_dirents,
             filesystem,
             source,
         })
@@ -307,6 +406,75 @@ impl<'a> Image<'a> {
                 .saturating_add(self.image_header.image_size),
         }
     }
+
+    /// Filesystem trailer checksum pair (`image_trailer`).
+    ///
+    /// The computed value sums the 32-bit words of the filesystem region
+    /// [header, trailer) in the image's byte order and negates them, the
+    /// rule the reference tool applies on little-endian images. Returns
+    /// `None` when the image is too small to carry a trailer or its size
+    /// is not padded to four bytes.
+    pub fn image_checksum(&self) -> Option<Checksums> {
+        let total = self.image_header.image_size;
+        // One data word plus the trailer word must exist, and mkifs pads
+        // the image to a multiple of four.
+        if total < 8 || !total.is_multiple_of(4) {
+            return None;
+        }
+        let start = self.header_offset;
+        let data_end = start.checked_add(total)?.checked_sub(4)?;
+        let end = data_end.checked_add(4)?;
+        let bytes = self.filesystem.as_slice();
+
+        let trailer = bytes.get(data_end..end)?;
+        let stored = read_word(trailer.try_into().ok()?, self.endian);
+        Some(Checksums {
+            stored,
+            computed: checksum_region(bytes.get(start..data_end)?, self.endian),
+        })
+    }
+
+    /// Startup trailer checksum pair (`startup_trailer`).
+    ///
+    /// Covered region is [startup header, trailer) of the startup
+    /// section, summed in the startup header's own byte order; mkifs
+    /// applies the same negate-and-sum rule as for the filesystem
+    /// trailer, and the reference tool only validates the filesystem one.
+    /// Returns `None` for bare filesystems or when the startup section is
+    /// too small or not padded to four bytes.
+    pub fn startup_checksum(&self) -> Option<Checksums> {
+        let startup = self.startup.as_ref()?;
+        let size = startup.startup_size;
+        if size < 8 || !size.is_multiple_of(4) {
+            return None;
+        }
+        let begin = self.startup_offset;
+        let data_end = begin.checked_add(size)?.checked_sub(4)?;
+        let end = data_end.checked_add(4)?;
+        let trailer = self.source.get(data_end..end)?;
+        let stored = read_word(trailer.try_into().ok()?, startup.endian);
+        Some(Checksums {
+            stored,
+            computed: checksum_region(self.source.get(begin..data_end)?, startup.endian),
+        })
+    }
+}
+
+/// Read one 32-bit word in the image's byte order.
+const fn read_word(word: &[u8; 4], endian: Endian) -> u32 {
+    match endian {
+        Endian::Little => u32::from_le_bytes(*word),
+        Endian::Big => u32::from_be_bytes(*word),
+    }
+}
+
+/// Reference trailer checksum rule over an exact multiple of four bytes.
+fn checksum_region(bytes: &[u8], endian: Endian) -> u32 {
+    let mut sum: u32 = 0;
+    for word in bytes.as_chunks::<4>().0 {
+        sum = sum.wrapping_add(read_word(word, endian));
+    }
+    sum.wrapping_neg()
 }
 
 /// Size of a regular file entry payload.

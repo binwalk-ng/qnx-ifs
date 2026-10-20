@@ -129,7 +129,7 @@ fn rejects_malformed_framing() {
     assert_eq!(decode(&[0x00, 0x04, 0x11, 0x22]), Err(Error::Truncated));
     // Malformed LZO block.
     let malformed = frame_blocks(&[&[0xFF, 0xFF, 0xFF]]);
-    assert!(matches!(decode(&malformed), Err(Error::Decompression(_))));
+    assert!(matches!(decode(&malformed), Err(Error::Decompress(_))));
     // Trailing bytes after the zero-length terminator are ignored, matching
     // the reference tool which stops reading at the terminator.
     let mut region = frame_blocks(&[&lzokay::compress::compress(b"payload").unwrap()]);
@@ -161,6 +161,6 @@ fn enforces_output_limits() {
     // Passing `Compress::None` here is an API misuse and is reported as such.
     assert_eq!(
         decompress_region(&[], Compress::None, &Limits::default()),
-        Err(Error::Decompress("region is not compressed"))
+        Err(Error::Decompress("region is not compressed".to_string()))
     );
 }

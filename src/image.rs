@@ -69,6 +69,10 @@ pub mod image_flags {
 /// Byte size of the fixed part of the image header (mountpoint follows).
 pub(crate) const IMAGE_HEADER_SIZE: usize = 88;
 
+/// Recording cap for skipped dirents: bounds the memory a hostile image
+/// can force the parser to spend on quarantine records.
+pub const MAX_OMITTED_DIRENTS: usize = 100_000;
+
 /// Common directory entry attributes (`struct image_attr`), 24 bytes.
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned, Debug)]
 #[repr(C, packed)]
@@ -151,9 +155,18 @@ pub struct ImageHeader {
 pub struct Entry {
     /// Stored entry path, without a leading slash.
     pub path: String,
+    /// Stored entry path as raw bytes, before the lossy UTF-8 conversion
+    /// behind [`Entry::path`]. Firmware paths may be arbitrary bytes; use
+    /// these for byte-exact disk output.
+    pub raw_path: Vec<u8>,
     /// Entry payload.
     pub kind: EntryKind,
-    /// Inode number (zero is used by `mkifs` for entries without inode).
+    /// Inode number.
+    ///
+    /// Zero-inode dirents are skipped while parsing (the kernel skips
+    /// them) and reported through [`crate::Image::omitted_dirents`], so
+    /// parsed entries in [`crate::Image::entries`] never have a zero
+    /// inode here.
     pub ino: u32,
     /// Raw mode bits, including the file type bits.
     pub mode: u32,
@@ -183,6 +196,8 @@ pub enum EntryKind {
     Symlink {
         /// Symlink target string.
         target: String,
+        /// Symlink target as raw bytes, before the lossy UTF-8 conversion.
+        raw_target: Vec<u8>,
     },
     /// Character device node.
     Char {
@@ -219,6 +234,27 @@ pub enum EntryKind {
         /// Real device id.
         rdev: u32,
     },
+}
+
+/// A directory entry the parser skipped because the kernel would skip it
+/// (`ino == 0`).
+///
+/// Recorded for transparency: skipped dirents never appear in
+/// [`Image::entries`](crate::Image::entries) and are not extracted, but
+/// their position and fixed-size attribute fields remain available for
+/// reporting. No strings are parsed from them, and recording stops at
+/// [`MAX_OMITTED_DIRENTS`] to bound memory on hostile images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OmittedDirent {
+    /// Byte offset of the dirent, relative to the image header
+    /// (`Image::header_offset`).
+    pub offset: usize,
+    /// Recorded size of the dirent (at least 24).
+    pub size: usize,
+    /// Raw mode bits, including the file type bits.
+    pub mode: u32,
+    /// Offset of extended attribute data, zero if none.
+    pub extattr_offset: u16,
 }
 
 impl Entry {
@@ -273,9 +309,10 @@ impl AttrParsed {
         }
     }
 
-    const fn entry_common(self, path: String, kind: EntryKind) -> Entry {
+    const fn entry_common(self, path: String, raw_path: Vec<u8>, kind: EntryKind) -> Entry {
         Entry {
             path,
+            raw_path,
             kind,
             ino: self.ino,
             mode: self.mode,
@@ -295,11 +332,20 @@ pub fn find_image_header(data: &[u8]) -> Option<usize> {
         return None;
     }
     for off in 0..=(data.len() - IMAGE_SIGNATURE.len()) {
-        if &data[off..off + IMAGE_SIGNATURE.len()] == IMAGE_SIGNATURE {
+        // Every occurrence starts with the same first byte.
+        if data[off] != b'i' {
+            continue;
+        }
+        if matches_signature(data, off) {
             return Some(off);
         }
     }
     None
+}
+
+/// Compare the seven signature bytes at `offset`.
+fn matches_signature(data: &[u8], offset: usize) -> bool {
+    &data[offset..offset + IMAGE_SIGNATURE.len()] == IMAGE_SIGNATURE
 }
 
 /// Parse the image filesystem header at `offset`.
@@ -334,13 +380,26 @@ pub fn parse_image_header(data: &[u8], offset: usize) -> Result<(ImageHeader, En
             }
         };
 
-    // The mountpoint is a NUL terminated string bounded by the dirent area.
-    let mountpoint_end = if dir_offset > IMAGE_HEADER_SIZE && dir_offset <= bytes.len() {
+    // The mountpoint is a NUL terminated string bounded by the dirent
+    // area. It only exists when `dir_offset` leaves room after the fixed
+    // fields; the scan must never run past the declared extent, and a
+    // `dir_offset` of exactly the fixed header size means there is no
+    // mountpoint at all.
+    //
+    // `hdr_dir_size` is another structural upper bound: clamping by it
+    // keeps an attacker-sized `dir_offset` from scanning and allocating
+    // to the end of the input before validation rejects the header. The
+    // `max` keeps the range valid if `hdr_dir_size` is itself below the
+    // fixed header size.
+    let mountpoint_end = if dir_offset > IMAGE_HEADER_SIZE {
         dir_offset
+            .min(hdr_dir_size)
+            .min(bytes.len())
+            .max(IMAGE_HEADER_SIZE)
     } else {
-        bytes.len()
+        IMAGE_HEADER_SIZE
     };
-    let mountpoint = read_cstring(&bytes[IMAGE_HEADER_SIZE..mountpoint_end]);
+    let (mountpoint, _) = cstring(&bytes[IMAGE_HEADER_SIZE..mountpoint_end]);
 
     let header = ImageHeader {
         image_size,
@@ -405,13 +464,19 @@ pub(crate) fn validate_image_header(
 ///
 /// `base` is the offset of the image header within `data`; a zero size
 /// entry ends the chain and every entry must lie inside `data`.
+///
+/// Dirents marked with a zero inode are skipped (the kernel skips them,
+/// and untrusted dirents must not enter the extraction set) and are not
+/// included in the returned entries. Whole-image callers can inspect
+/// the skipped records through [`crate::Image::omitted_dirents`].
 pub fn parse_dirents(
     data: &[u8],
     base: usize,
     dir_pos: usize,
     endian: Endian,
 ) -> Result<Vec<Entry>, Error> {
-    parse_dirents_bounded(data, base, dir_pos, data.len(), data.len(), endian)
+    let (entries, _) = parse_dirents_bounded(data, base, dir_pos, data.len(), data.len(), endian)?;
+    Ok(entries)
 }
 
 /// Walk the dirent chain with explicit bounds.
@@ -419,6 +484,9 @@ pub fn parse_dirents(
 /// The chain must end with a zero size entry at or before `dir_end`
 /// (the end of the image directory area), and referenced file contents
 /// must end at or before `data_end`.
+///
+/// Returns the entries plus the quarantine records for skipped
+/// zero-inode dirents (see [`OmittedDirent`]).
 pub(crate) fn parse_dirents_bounded(
     data: &[u8],
     base: usize,
@@ -426,8 +494,9 @@ pub(crate) fn parse_dirents_bounded(
     dir_end: usize,
     data_end: usize,
     endian: Endian,
-) -> Result<Vec<Entry>, Error> {
+) -> Result<(Vec<Entry>, Vec<OmittedDirent>), Error> {
     let mut entries = Vec::new();
+    let mut omitted: Vec<OmittedDirent> = Vec::new();
     let mut pos = dir_pos;
 
     loop {
@@ -446,7 +515,7 @@ pub(crate) fn parse_dirents_bounded(
         } as usize;
 
         if size == 0 {
-            return Ok(entries);
+            return Ok((entries, omitted));
         }
         if size < 24 {
             return Err(Error::BadDirent);
@@ -459,7 +528,19 @@ pub(crate) fn parse_dirents_bounded(
         let attr = parse_attr(&dirent[..24], endian)?;
 
         // The kernel skips entries whose inode is zero (sys/image.h).
+        // They are recorded in the quarantine list rather than being
+        // silently dropped; no strings are parsed from them.
         if attr.ino == 0 {
+            if omitted.len() < MAX_OMITTED_DIRENTS
+                && let Some(offset) = pos.checked_sub(base)
+            {
+                omitted.push(OmittedDirent {
+                    offset,
+                    size,
+                    mode: attr.mode,
+                    extattr_offset: attr.extattr_offset,
+                });
+            }
             pos = end;
             continue;
         }
@@ -501,11 +582,15 @@ fn device_extra_fields<O: ByteOrder>(bytes: &[u8]) -> Result<(u32, u32), Error> 
 
 /// Read a NUL terminated string from a bounded slice.
 ///
-/// Strings without a NUL in the bound are returned up to the bound;
-/// invalid UTF-8 is replaced.
-fn read_cstring(bytes: &[u8]) -> String {
+/// Returns the lossy UTF-8 rendering together with the raw stored bytes
+/// (excluding the NUL terminator, if any). Strings without a NUL in the
+/// bound are returned up to the bound.
+fn cstring(bytes: &[u8]) -> (String, &[u8]) {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
+    (
+        String::from_utf8_lossy(&bytes[..end]).into_owned(),
+        &bytes[..end],
+    )
 }
 
 /// Parse a `S_IFREG` directory entry.
@@ -525,7 +610,7 @@ fn parse_file_entry(
         Endian::Little => file_extra_fields::<LE>(&dirent[24..])?,
         Endian::Big => file_extra_fields::<BE>(&dirent[24..])?,
     };
-    let path = read_cstring(&dirent[32..]);
+    let (path, raw_path) = cstring(&dirent[32..]);
 
     // File contents must lie inside the image data.
     let abs = base
@@ -536,16 +621,17 @@ fn parse_file_entry(
         return Err(Error::BadOffset);
     }
 
-    Ok(attr.entry_common(path, EntryKind::File { offset, size }))
+    Ok(attr.entry_common(path, raw_path.to_vec(), EntryKind::File { offset, size }))
 }
 
 /// Parse a `S_IFDIR` directory entry.
 fn parse_dir_entry(dirent: &[u8], attr: &AttrParsed) -> Entry {
     // attr (24) followed by the NUL terminated path.
     if dirent.len() >= 25 {
-        attr.entry_common(read_cstring(&dirent[24..]), EntryKind::Dir)
+        let (path, raw_path) = cstring(&dirent[24..]);
+        attr.entry_common(path, raw_path.to_vec(), EntryKind::Dir)
     } else {
-        attr.entry_common(String::new(), EntryKind::Dir)
+        attr.entry_common(String::new(), Vec::new(), EntryKind::Dir)
     }
 }
 
@@ -564,17 +650,24 @@ fn parse_symlink_entry(dirent: &[u8], attr: &AttrParsed, endian: Endian) -> Resu
     };
 
     let path_end = 28usize.checked_add(sym_offset).ok_or(Error::BadDirent)?;
-    let path = read_cstring(dirent.get(28..path_end).ok_or(Error::BadDirent)?);
+    let (path, raw_path) = cstring(dirent.get(28..path_end).ok_or(Error::BadDirent)?);
 
-    let target = if sym_size == 0 {
-        String::new()
+    let kind = if sym_size == 0 {
+        EntryKind::Symlink {
+            target: String::new(),
+            raw_target: Vec::new(),
+        }
     } else {
         let target_end = path_end.checked_add(sym_size).ok_or(Error::BadDirent)?;
-        let target_bytes = dirent.get(path_end..target_end).ok_or(Error::BadDirent)?;
-        read_cstring(target_bytes)
+        let (target, raw_target) =
+            cstring(dirent.get(path_end..target_end).ok_or(Error::BadDirent)?);
+        EntryKind::Symlink {
+            target,
+            raw_target: raw_target.to_vec(),
+        }
     };
 
-    Ok(attr.entry_common(path, EntryKind::Symlink { target }))
+    Ok(attr.entry_common(path, raw_path.to_vec(), kind))
 }
 
 /// Parse a device type directory entry (char/block/fifo/named/socket).
@@ -595,5 +688,6 @@ fn parse_device_entry(dirent: &[u8], attr: &AttrParsed, endian: Endian) -> Resul
         S_IFSOCK => EntryKind::Socket { dev, rdev },
         _ => EntryKind::Fifo { dev, rdev },
     };
-    Ok(attr.entry_common(read_cstring(&dirent[32..]), kind))
+    let (path, raw_path) = cstring(&dirent[32..]);
+    Ok(attr.entry_common(path, raw_path.to_vec(), kind))
 }

@@ -1,13 +1,17 @@
 //! Error type and message formatting for the crate.
 
 /// Errors produced while parsing or decompressing QNX IFS images.
+///
+/// The enum is `#[non_exhaustive]`: new variants may be added in minor
+/// releases without a breaking change, so `match` arms need a catch-all.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Data ended unexpectedly while parsing a structure.
     Truncated,
     /// The startup header signature or version number is not valid.
     BadStartupHeader,
-    /// A startup header reserve/zeros field contained non-zero data.
+    /// A startup header reserve/zero field contained non-zero data.
     BadStartupHeaderZeros,
     /// The image filesystem signature is not valid.
     BadImageHeader,
@@ -21,14 +25,10 @@ pub enum Error {
     UnknownCompression(u8),
     /// The requested backend is compiled out of this build.
     FeatureDisabled(&'static str),
-    /// A decompression backend rejected the compressed data.
-    Decompress(&'static str),
     /// A decompression backend rejected the compressed data, with context.
-    Decompression(String),
+    Decompress(String),
     /// The decompressed data exceeded a configured sanity limit.
     DecompressTooLarge,
-    /// A string field was not NUL terminated within its declared bounds.
-    UnterminatedString,
     /// Data referenced by an offset lies outside the image.
     BadOffset,
 }
@@ -52,11 +52,9 @@ impl std::fmt::Display for Error {
                 write!(f, "decompression backend \"{feat}\" is compiled out")
             }
             Self::Decompress(msg) => write!(f, "decompression failed: {msg}"),
-            Self::Decompression(msg) => write!(f, "decompression failed: {msg}"),
             Self::DecompressTooLarge => {
                 write!(f, "decompressed size exceeds configured limit")
             }
-            Self::UnterminatedString => write!(f, "string field not NUL terminated"),
             Self::BadOffset => write!(f, "struct field offset out of bounds"),
         }
     }

@@ -4,6 +4,9 @@
 //! a subset of the helpers, so dead-code warnings are expected.
 #![allow(dead_code)]
 
+/// Byte-accurate image fixture builders.
+pub mod fixtures;
+
 /// Decode a hex string into bytes.
 pub fn hex_to_bytes(hex: &str) -> Vec<u8> {
     (0..hex.len())
