@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Exchanges the GitHub OIDC token for a short-lived crates.io token.
+      # No API tokens stored in secrets. The repository and this workflow
+      # filename (release.yaml) must match the trusted publisher registered
+      # at https://crates.io/crates/qnx-ifs/settings.
+      - name: Authenticate with crates.io
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

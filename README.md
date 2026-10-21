@@ -1,5 +1,7 @@
 # qnx-ifs
 
+[![crates.io](https://img.shields.io/crates/v/qnx-ifs.svg)](https://crates.io/crates/qnx-ifs)
+
 Pure-Rust parser and decompressor for QNX IFS ("Image File System") firmware
 images, as produced by QNX `mkifs`/`mkxfs` — the format commonly handled with
 the external `dumpifs` utility.
