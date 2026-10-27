@@ -439,6 +439,48 @@ fn mountpoint_scan_is_bounded_by_header_sizes() {
 }
 
 #[test]
+fn exported_header_layout_matches_parser() {
+    use qnx_ifs::{IMAGE_HEADER_SIZE, ImageHeader, ImageHeaderBytes};
+    use zerocopy::FromBytes;
+    use zerocopy::byteorder::{BE, ByteOrder, LE};
+
+    /// The exported layout must produce the parser's field values.
+    fn assert_fields_match<O: ByteOrder>(raw: &ImageHeaderBytes<O>, header: &ImageHeader) {
+        assert_eq!(&raw.signature, qnx_ifs::image::IMAGE_SIGNATURE);
+        assert_eq!(raw.image_size.get() as usize, header.image_size);
+        assert_eq!(raw.hdr_dir_size.get() as usize, header.hdr_dir_size);
+        assert_eq!(raw.dir_offset.get() as usize, header.dir_offset);
+        assert_eq!(raw.boot_ino.map(|w| w.get()), header.boot_ino);
+        assert_eq!(raw.script_ino.get(), header.script_ino);
+        assert_eq!(raw.chain_paddr.get(), header.chain_paddr);
+        assert_eq!(raw.mountflags.get(), header.mountflags);
+    }
+
+    for (endian, e) in [(Endian::Little, E::LE), (Endian::Big, E::BE)] {
+        let filesystem = build_filesystem(e);
+
+        let (header, parsed_endian) = qnx_ifs::parse_image_header(&filesystem, 0).expect("header");
+        assert_eq!(parsed_endian, endian);
+
+        match endian {
+            Endian::Little => {
+                let (raw, _) = ImageHeaderBytes::<LE>::ref_from_prefix(&filesystem).expect("cast");
+                assert_fields_match(raw, &header);
+            }
+            Endian::Big => {
+                let (raw, _) = ImageHeaderBytes::<BE>::ref_from_prefix(&filesystem).expect("cast");
+                assert_fields_match(raw, &header);
+            }
+        }
+
+        // `IMAGE_HEADER_SIZE` is where the mountpoint string starts.
+        let mountpoint = &filesystem[IMAGE_HEADER_SIZE..IMAGE_HEADER_SIZE + 4];
+        assert_eq!(mountpoint, b"/fs\0");
+        assert_eq!(header.mountpoint, "/fs");
+    }
+}
+
+#[test]
 fn bare_imagefs_takes_precedence_over_embedded_startup_header() {
     let filesystem = build_filesystem(E::LE);
     let mut data = filesystem.clone();

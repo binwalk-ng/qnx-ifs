@@ -74,6 +74,8 @@ without a leading slash.
 | `Image::image_checksum` / `startup_checksum` | Stored vs. recomputed trailer checksum pair (`Checksums::valid`) |
 | `StartupHeader` | Startup header fields: machine, load addresses, sizes, endianness, compression |
 | `ImageHeader` | Mountpoint, flags, inode metadata, chain info |
+| `ImageHeaderBytes` | On-disk `struct image_header` layout (`U32` byte-order fields) for hand-casting raw bytes |
+| `IMAGE_HEADER_SIZE` | Byte size of the fixed image header fields; the NUL terminated mountpoint starts at this offset |
 | `Entry` / `EntryKind` | Path, raw path bytes, inode, mode, uid/gid/mtime, and the type-specific payload |
 | `ImageData` | Decompressed or borrowed filesystem bytes (`Deref<Target = [u8]>`) |
 | `Limits` / `ParseOptions` | Decompression bounds and parsing policy knobs |

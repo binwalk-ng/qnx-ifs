@@ -67,8 +67,8 @@ pub mod ucl;
 
 pub use error::Error;
 pub use image::{
-    Entry, EntryKind, ImageHeader, MAX_OMITTED_DIRENTS, OmittedDirent, find_image_header,
-    parse_dirents, parse_image_header,
+    Entry, EntryKind, IMAGE_HEADER_SIZE, ImageHeader, ImageHeaderBytes, MAX_OMITTED_DIRENTS,
+    OmittedDirent, find_image_header, parse_dirents, parse_image_header,
 };
 
 mod startup;
