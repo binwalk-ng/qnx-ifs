@@ -66,8 +66,9 @@ pub mod image_flags {
     pub const INO_BITS: u8 = 0x04;
 }
 
-/// Byte size of the fixed part of the image header (mountpoint follows).
-pub(crate) const IMAGE_HEADER_SIZE: usize = 88;
+/// Byte size of the fixed part of the image header (`struct image_header`);
+/// the NUL terminated `mountpoint` follows at this offset.
+pub const IMAGE_HEADER_SIZE: usize = size_of::<ImageHeaderBytes<LE>>();
 
 /// Recording cap for skipped dirents: bounds the memory a hostile image
 /// can force the parser to spend on quarantine records.
@@ -110,20 +111,52 @@ struct DeviceExtraBytes<O: ByteOrder> {
     rdev: U32<O>,
 }
 
-/// Image filesystem header (`struct image_header`).
+/// On-disk image filesystem header (`struct image_header`), up to the
+/// NUL terminated `mountpoint` string.
+///
+/// Multi-byte fields are [`U32`] byte-order wrappers; convert with their
+/// `get` method. Instantiate with `LE` or `BE` according to the header's
+/// [`BIGENDIAN`](crate::image::image_flags::BIGENDIAN) flag.
+/// [`parse_image_header`](crate::parse_image_header) validates and parses
+/// these fields into [`ImageHeader`].
+///
+/// # Example
+///
+/// ```no_run
+/// use qnx_ifs::ImageHeaderBytes;
+/// use zerocopy::{FromBytes, LE};
+///
+/// # fn caller(data: &[u8]) -> Option<(u32, &[u8])> {
+/// let (raw, rest) = ImageHeaderBytes::<LE>::ref_from_prefix(data).ok()?;
+/// let nul = rest.iter().position(|&b| b == 0)?;
+/// Some((raw.image_size.get(), &rest[..nul]))
+/// # }
+/// ```
+///
+/// `signature` is not checked; compare it with [`IMAGE_SIGNATURE`].
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned, Debug)]
 #[repr(C, packed)]
-struct ImageHeaderBytes<O: ByteOrder> {
-    signature: [u8; 7],
-    flags: u8,
-    image_size: U32<O>,
-    hdr_dir_size: U32<O>,
-    dir_offset: U32<O>,
-    boot_ino: [U32<O>; 4],
-    script_ino: U32<O>,
-    chain_paddr: U32<O>,
-    spare: [U32<O>; 10],
-    mountflags: U32<O>,
+pub struct ImageHeaderBytes<O: ByteOrder> {
+    /// Image signature, always `imagefs`.
+    pub signature: [u8; 7],
+    /// Flag byte; [`image_flags`](image_flags) names the bits.
+    pub flags: u8,
+    /// Byte size from the header to the end of the image trailer.
+    pub image_size: U32<O>,
+    /// Byte size from the header to the last directory entry.
+    pub hdr_dir_size: U32<O>,
+    /// Offset from the header to the first directory entry.
+    pub dir_offset: U32<O>,
+    /// Inodes of the bootstrap programs.
+    pub boot_ino: [U32<O>; 4],
+    /// Inode of the startup script.
+    pub script_ino: U32<O>,
+    /// Physical address of a chained image filesystem.
+    pub chain_paddr: U32<O>,
+    /// Reserved; `mkifs` writes zero.
+    pub spare: [U32<O>; 10],
+    /// Default mount flags.
+    pub mountflags: U32<O>,
     // A NUL terminated `mountpoint` string follows the fixed fields.
 }
 
