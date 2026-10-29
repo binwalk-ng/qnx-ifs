@@ -114,6 +114,18 @@ struct DeviceExtraBytes<O: ByteOrder> {
     rdev: U32<O>,
 }
 
+/// Fixed sizes of the dirent prefixes, derived from the structs above.
+/// The wire format does not depend on the byte order, so the `LE` form
+/// is used for the derivation.
+const ATTR_SIZE: usize = size_of::<AttrBytes<LE>>();
+/// Fixed part of a file dirent, before the stored path.
+const FILE_DIRENT_FIXED: usize = ATTR_SIZE + size_of::<FileExtraBytes<LE>>();
+/// Fixed part of a symlink dirent; the stored path starts here and
+/// `sym_offset` is relative to it.
+const SYMLINK_DIRENT_FIXED: usize = ATTR_SIZE + size_of::<SymlinkExtraBytes<LE>>();
+/// Fixed part of a device dirent, before the stored path.
+const DEVICE_DIRENT_FIXED: usize = ATTR_SIZE + size_of::<DeviceExtraBytes<LE>>();
+
 /// On-disk image filesystem header (`struct image_header`), up to the
 /// NUL terminated `mountpoint` string.
 ///
@@ -592,7 +604,7 @@ pub(crate) fn parse_dirents_bounded(
         if size == 0 {
             return Ok((entries, omitted));
         }
-        if size < 24 {
+        if size < ATTR_SIZE {
             return Err(Error::BadDirent { offset: pos });
         }
         let end = pos
@@ -602,7 +614,7 @@ pub(crate) fn parse_dirents_bounded(
             return Err(Error::BadDirent { offset: pos });
         }
         let dirent = &data[pos..end];
-        let attr = parse_attr(&dirent[..24], endian, pos)?;
+        let attr = parse_attr(&dirent[..ATTR_SIZE], endian, pos)?;
 
         // The kernel skips entries whose inode is zero (sys/image.h).
         // They are recorded in the quarantine list rather than being
@@ -686,15 +698,14 @@ fn parse_file_entry(
     endian: Endian,
     data_end: usize,
 ) -> Result<Entry, Error> {
-    // attr (24) + offset (4) + size (4), path may be empty.
-    if dirent.len() < 32 {
+    if dirent.len() < FILE_DIRENT_FIXED {
         return Err(Error::BadDirent { offset });
     }
     let (file_offset, size) = match endian {
-        Endian::Little => file_extra_fields::<LE>(&dirent[24..], offset)?,
-        Endian::Big => file_extra_fields::<BE>(&dirent[24..], offset)?,
+        Endian::Little => file_extra_fields::<LE>(&dirent[ATTR_SIZE..], offset)?,
+        Endian::Big => file_extra_fields::<BE>(&dirent[ATTR_SIZE..], offset)?,
     };
-    let (path, raw_path) = cstring(&dirent[32..]);
+    let (path, raw_path) = cstring(&dirent[FILE_DIRENT_FIXED..]);
 
     // File contents must lie inside the image data.
     let abs = base
@@ -717,9 +728,8 @@ fn parse_file_entry(
 
 /// Parse a `S_IFDIR` directory entry.
 fn parse_dir_entry(dirent: &[u8], attr: &AttrParsed) -> Entry {
-    // attr (24) followed by the NUL terminated path.
-    if dirent.len() >= 25 {
-        let (path, raw_path) = cstring(&dirent[24..]);
+    if dirent.len() > ATTR_SIZE {
+        let (path, raw_path) = cstring(&dirent[ATTR_SIZE..]);
         attr.entry_common(path, raw_path.to_vec(), EntryKind::Dir)
     } else {
         attr.entry_common(String::new(), Vec::new(), EntryKind::Dir)
@@ -728,29 +738,28 @@ fn parse_dir_entry(dirent: &[u8], attr: &AttrParsed) -> Entry {
 
 /// Parse a `S_IFLNK` directory entry.
 ///
-/// `sym_offset` is relative to the `path` field at offset 28; the target
-/// of `sym_size` bytes follows the path inline.
+/// `sym_offset` is relative to the `path` field; the target of
+/// `sym_size` bytes follows the path inline.
 fn parse_symlink_entry(
     offset: usize,
     dirent: &[u8],
     attr: &AttrParsed,
     endian: Endian,
 ) -> Result<Entry, Error> {
-    // attr (24) + sym_offset (2) + sym_size (2) + path + target.
-    if dirent.len() < 28 {
+    if dirent.len() < SYMLINK_DIRENT_FIXED {
         return Err(Error::BadDirent { offset });
     }
     let (sym_offset, sym_size) = match endian {
-        Endian::Little => symlink_extra_fields::<LE>(&dirent[24..], offset)?,
-        Endian::Big => symlink_extra_fields::<BE>(&dirent[24..], offset)?,
+        Endian::Little => symlink_extra_fields::<LE>(&dirent[ATTR_SIZE..], offset)?,
+        Endian::Big => symlink_extra_fields::<BE>(&dirent[ATTR_SIZE..], offset)?,
     };
 
-    let path_end = 28usize
+    let path_end = SYMLINK_DIRENT_FIXED
         .checked_add(sym_offset)
         .ok_or(Error::BadDirent { offset })?;
     let (path, raw_path) = cstring(
         dirent
-            .get(28..path_end)
+            .get(SYMLINK_DIRENT_FIXED..path_end)
             .ok_or(Error::BadDirent { offset })?,
     );
 
@@ -784,13 +793,12 @@ fn parse_device_entry(
     attr: &AttrParsed,
     endian: Endian,
 ) -> Result<Entry, Error> {
-    // attr (24) + dev (4) + rdev (4), followed by the path.
-    if dirent.len() < 32 {
+    if dirent.len() < DEVICE_DIRENT_FIXED {
         return Err(Error::BadDirent { offset });
     }
     let (dev, rdev) = match endian {
-        Endian::Little => device_extra_fields::<LE>(&dirent[24..], offset)?,
-        Endian::Big => device_extra_fields::<BE>(&dirent[24..], offset)?,
+        Endian::Little => device_extra_fields::<LE>(&dirent[ATTR_SIZE..], offset)?,
+        Endian::Big => device_extra_fields::<BE>(&dirent[ATTR_SIZE..], offset)?,
     };
 
     let kind = match attr.mode & S_IFMT {
@@ -800,6 +808,6 @@ fn parse_device_entry(
         S_IFSOCK => EntryKind::Socket { dev, rdev },
         _ => EntryKind::Fifo { dev, rdev },
     };
-    let (path, raw_path) = cstring(&dirent[32..]);
+    let (path, raw_path) = cstring(&dirent[DEVICE_DIRENT_FIXED..]);
     Ok(attr.entry_common(path, raw_path.to_vec(), kind))
 }
