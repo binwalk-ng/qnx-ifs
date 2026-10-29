@@ -102,6 +102,24 @@ pub fn image_header(
     dir_offset: usize,
     mountpoint: &str,
 ) -> Vec<u8> {
+    image_header_raw(
+        endian,
+        image_size,
+        hdr_dir_size,
+        dir_offset,
+        mountpoint.as_bytes(),
+    )
+}
+
+/// Like [`image_header`], but with raw mountpoint bytes, for stored
+/// paths that are not valid UTF-8.
+pub fn image_header_raw(
+    endian: E,
+    image_size: usize,
+    hdr_dir_size: usize,
+    dir_offset: usize,
+    mountpoint: &[u8],
+) -> Vec<u8> {
     let mut header = Vec::new();
     header.extend_from_slice(b"imagefs");
     header.push(if endian.be { 0x01 } else { 0x00 });
@@ -117,7 +135,7 @@ pub fn image_header(
         header.extend_from_slice(&endian.u32(0)); // spare
     }
     header.extend_from_slice(&endian.u32(0)); // mountflags
-    header.extend_from_slice(mountpoint.as_bytes());
+    header.extend_from_slice(mountpoint);
     header.push(0);
     let aligned = align4(header.len());
     header.resize(aligned, 0);

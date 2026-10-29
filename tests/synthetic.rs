@@ -8,8 +8,15 @@
 //! error cases.
 #![allow(clippy::panic)] // test assertions panic by design
 
+use std::mem::offset_of;
+
 use common::fixtures::*;
-use qnx_ifs::{Endian, EntryKind, Error, Image};
+use qnx_ifs::{Endian, EntryKind, Error, IMAGE_HEADER_SIZE, Image};
+use zerocopy::byteorder::LE;
+
+/// A little-endian raw image header, matching the synthetic LE fixtures;
+/// field offsets are taken from this via [`offset_of!`].
+type RawHeader = qnx_ifs::ImageHeaderBytes<LE>;
 
 mod common;
 
@@ -245,17 +252,17 @@ fn rejects_bad_image_header_sizes() {
     let original = build_image(E::LE, TestCompress::None);
 
     let mut data = original.clone();
-    let image_size_at = filesystem_offset + 8;
+    let image_size_at = filesystem_offset + offset_of!(RawHeader, image_size);
     data[image_size_at..image_size_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(Image::parse(&data).unwrap_err(), Error::BadImageHeader);
 
     let mut data = original.clone();
-    let hdr_dir_size_at = filesystem_offset + 12;
+    let hdr_dir_size_at = filesystem_offset + offset_of!(RawHeader, hdr_dir_size);
     data[hdr_dir_size_at..hdr_dir_size_at + 4].copy_from_slice(&0u32.to_le_bytes());
     assert_eq!(Image::parse(&data).unwrap_err(), Error::BadImageHeader);
 
     let mut data = original;
-    let dir_offset_at = filesystem_offset + 16;
+    let dir_offset_at = filesystem_offset + offset_of!(RawHeader, dir_offset);
     data[dir_offset_at..dir_offset_at + 4].copy_from_slice(&0u32.to_le_bytes());
     assert_eq!(Image::parse(&data).unwrap_err(), Error::BadImageHeader);
 }
@@ -268,14 +275,21 @@ fn rejects_bad_dirents() {
 
     let mut data = build_image(E::LE, TestCompress::None);
     data[first_dirent..first_dirent + 2].copy_from_slice(&1u16.to_le_bytes());
-    assert_eq!(Image::parse(&data).unwrap_err(), Error::BadDirent);
+    assert_eq!(
+        Image::parse(&data).unwrap_err(),
+        Error::BadDirent {
+            offset: first_dirent
+        }
+    );
 
     // Remove the terminator so the chain runs into the file data.
     let mut data = build_image(E::LE, TestCompress::None);
     data[terminator..terminator + 2].copy_from_slice(&0x0200u16.to_le_bytes());
     assert!(matches!(
         Image::parse(&data).unwrap_err(),
-        Error::UnknownDirentType | Error::BadDirent | Error::UnterminatedDirents
+        Error::UnknownDirentType { .. }
+            | Error::BadDirent { .. }
+            | Error::UnterminatedDirents { .. }
     ));
 }
 
@@ -340,7 +354,10 @@ fn rejects_unknown_dirent_type() {
     let mut data = build_image(E::LE, TestCompress::None);
     let fifo = 264 + HEADER_LEN + ENTRY_OFFSETS[7];
     data[fifo + 8..fifo + 12].copy_from_slice(&0o030000u32.to_le_bytes());
-    assert_eq!(Image::parse(&data).unwrap_err(), Error::UnknownDirentType);
+    assert!(matches!(
+        Image::parse(&data).unwrap_err(),
+        Error::UnknownDirentType { offset } if offset == fifo
+    ));
 }
 
 #[test]
@@ -349,7 +366,7 @@ fn rejects_unterminated_dirent_chain() {
     let mut filesystem = image_header(E::LE, 128, 128, HEADER_LEN, MOUNTPOINT);
     filesystem.extend(dirent(E::LE, 24, &[], "bin", None, 10, 0o040755));
     let error = qnx_ifs::parse_dirents(&filesystem, 0, HEADER_LEN, Endian::Little).unwrap_err();
-    assert_eq!(error, Error::UnterminatedDirents);
+    assert!(matches!(error, Error::UnterminatedDirents { .. }));
 }
 
 #[cfg(feature = "zlib")]
@@ -374,9 +391,7 @@ fn parses_gzip_compressed_image() {
 #[test]
 fn enforces_decompression_limit() {
     let image_bytes = build_image(E::LE, TestCompress::Zlib);
-    let limits = qnx_ifs::Limits {
-        max_decompressed: 16,
-    };
+    let limits = qnx_ifs::Limits::default().with_max_decompressed(16);
     assert_eq!(
         Image::parse_with_limits(&image_bytes, &limits).unwrap_err(),
         Error::DecompressTooLarge
@@ -423,18 +438,22 @@ fn parses_mountless_bare_imagefs() {
 }
 
 #[test]
-fn mountpoint_scan_is_bounded_by_header_sizes() {
+fn mountpoint_scan_rejects_invalid_sizes_before_scanning() {
     let mut filesystem = build_filesystem(E::LE);
-    // Inconsistent, attacker-controlled sizes: a huge `dir_offset` and a
-    // dirent area that ends exactly at the header. Remove the unpacked
-    // mountpoint's NUL terminator so an unbounded scan would continue
-    // into the first dirent (whose size byte is 0x1c followed by NUL).
-    filesystem[12..16].copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
-    filesystem[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
-    filesystem[88..92].fill(b'A');
+    // Inconsistent, attacker-controlled sizes: a dirent area that ends
+    // exactly at the header and a huge `dir_offset`. Validation must
+    // reject the header before the mountpoint is read at all, and no
+    // later candidate exists to fall back to.
+    filesystem[offset_of!(RawHeader, hdr_dir_size)..offset_of!(RawHeader, dir_offset)]
+        .copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
+    filesystem[offset_of!(RawHeader, dir_offset)..offset_of!(RawHeader, dir_offset) + 4]
+        .copy_from_slice(&u32::MAX.to_le_bytes());
+    filesystem[IMAGE_HEADER_SIZE..IMAGE_HEADER_SIZE + 4].fill(b'A');
 
-    let (header, _) = qnx_ifs::parse_image_header(&filesystem, 0).expect("header");
-    assert_eq!(header.mountpoint, "AAAA");
+    assert_eq!(
+        qnx_ifs::parse_image_header(&filesystem, 0).unwrap_err(),
+        Error::BadImageHeader
+    );
     assert!(Image::parse_imagefs(&filesystem).is_err());
 }
 
@@ -831,4 +850,202 @@ fn lenient_options_accept_damaged_startup_header() {
 
     // Default options are strict, like `Image::parse`.
     assert!(Image::parse_with_options(&data, &qnx_ifs::ParseOptions::default()).is_err());
+}
+
+#[test]
+fn parse_imagefs_at_parses_known_offset_without_scanning() {
+    let filesystem = build_filesystem(E::LE);
+    let mut container = vec![0xAA; 32];
+    container.extend_from_slice(&filesystem);
+
+    let parsed = Image::parse_imagefs_at(&container, 32).expect("parse");
+    assert_eq!(parsed.header_offset, 32);
+    assert_eq!(parsed.entries.len(), 10);
+
+    // A wrong offset is an error, not a scan for another candidate.
+    assert!(Image::parse_imagefs_at(&container, 0).is_err());
+}
+
+#[test]
+fn parse_imagefs_finds_valid_header_after_lookalike() {
+    // A bare "imagefs" string whose fixed fields do not validate sits
+    // before the real filesystem; the parser must fall through to it.
+    let mut container = b"imagefs\0".to_vec();
+    container.extend(std::iter::repeat_n(0xAA, 40));
+    container.extend_from_slice(&build_filesystem(E::LE));
+
+    let parsed = Image::parse_imagefs(&container).expect("parse past look-alike");
+    assert_eq!(parsed.header_offset, 48);
+    assert_eq!(parsed.entries.len(), 10);
+}
+
+#[test]
+fn entry_limit_is_enforced() {
+    let filesystem = build_filesystem(E::LE); // 10 entries
+    let limits = qnx_ifs::Limits::default().with_max_entries(4);
+    assert_eq!(
+        Image::parse_imagefs_with_limits(&filesystem, &limits).unwrap_err(),
+        Error::LimitsExceeded
+    );
+
+    let limits = qnx_ifs::Limits::default().with_max_entries(10);
+    assert!(Image::parse_imagefs_with_limits(&filesystem, &limits).is_ok());
+}
+
+#[test]
+fn mountpoint_limit_is_enforced() {
+    let mountpoint = "/very/deep/mountpoint"; // 21 bytes
+    let header_len = align4(IMAGE_HEADER_SIZE + mountpoint.len() + 1);
+    let dir_area = 28 + 4; // one root directory dirent plus the terminator
+    let image_size = header_len + dir_area + 4; // plus the image trailer
+
+    let mut filesystem = image_header(
+        E::LE,
+        image_size,
+        header_len + dir_area,
+        header_len,
+        mountpoint,
+    );
+    filesystem.extend(dirent(E::LE, 24, &[], "bin", None, 10, 0o040755));
+    filesystem.extend_from_slice(&[0u8; 4]); // dirent chain terminator
+    filesystem.extend_from_slice(&[0u8; 4]); // image trailer
+    assert_eq!(filesystem.len(), image_size);
+
+    let limits = qnx_ifs::Limits::default().with_max_mountpoint_len(8);
+    assert_eq!(
+        Image::parse_imagefs_with_limits(&filesystem, &limits).unwrap_err(),
+        Error::LimitsExceeded
+    );
+
+    let limits = qnx_ifs::Limits::default().with_max_mountpoint_len(21);
+    let parsed = Image::parse_imagefs_with_limits(&filesystem, &limits).expect("parse");
+    assert_eq!(parsed.image_header.mountpoint, mountpoint);
+    assert_eq!(parsed.entries.len(), 1);
+}
+
+#[test]
+fn parse_at_skips_startup_header_search() {
+    let mut container = vec![0x55u8; 0x40];
+    container.extend_from_slice(&build_image(E::LE, TestCompress::None));
+
+    let parsed = Image::parse_at(&container, 0x40).expect("parse at");
+    assert_eq!(parsed.startup_offset, 0x40);
+    assert_eq!(parsed.entries.len(), 10);
+    assert_eq!(parsed.total_size(), container.len());
+
+    // A invalid offset is reported, not searched around.
+    assert!(Image::parse_at(&container, 0).is_err());
+}
+
+#[test]
+fn parse_at_parses_big_endian_image() {
+    let mut container = vec![0x55u8; 0x20];
+    container.extend_from_slice(&build_image(E::BE, TestCompress::None));
+
+    let parsed = Image::parse_at(&container, 0x20).expect("parse at");
+    assert_eq!(parsed.startup_offset, 0x20);
+    assert_eq!(parsed.endian, Endian::Big);
+    assert_eq!(parsed.entries.len(), 10);
+}
+
+#[test]
+fn parse_imagefs_at_with_limits_applies_limits() {
+    let filesystem = build_filesystem(E::BE);
+    let mut container = vec![0xAA; 16];
+    container.extend_from_slice(&filesystem);
+
+    let parsed = Image::parse_imagefs_at(&container, 16).expect("parse");
+    assert_eq!(parsed.header_offset, 16);
+    assert_eq!(parsed.endian, Endian::Big);
+    assert_eq!(parsed.entries.len(), 10);
+
+    let limits = qnx_ifs::Limits::default().with_max_entries(4);
+    assert_eq!(
+        Image::parse_imagefs_at_with_limits(&container, 16, &limits).unwrap_err(),
+        Error::LimitsExceeded
+    );
+}
+
+#[test]
+fn find_image_header_matches_reports_every_candidate() {
+    let mut container = b"imagefs".to_vec(); // look-alike at offset 0
+    container.extend_from_slice(&build_filesystem(E::LE));
+
+    assert_eq!(qnx_ifs::find_image_header_matches(&container), vec![0, 7]);
+    // The cheap single-match scan still reports the first one.
+    assert_eq!(qnx_ifs::find_image_header(&container), Some(0));
+    assert!(qnx_ifs::find_image_header_matches(b"no signature here").is_empty());
+}
+
+#[test]
+fn corrupt_header_falls_through_to_later_candidate() {
+    let mut container = build_filesystem(E::LE);
+    // Break the real header so it fails size validation.
+    let dir_offset = offset_of!(RawHeader, dir_offset);
+    container[dir_offset..dir_offset + 4].copy_from_slice(&0u32.to_le_bytes());
+    let fake_offset = container.len();
+    container.extend_from_slice(&build_filesystem(E::BE));
+
+    let parsed = Image::parse_imagefs(&container).expect("fall through to later candidate");
+    assert_eq!(parsed.header_offset, fake_offset);
+    assert_eq!(parsed.endian, Endian::Big);
+}
+
+#[test]
+fn dirent_error_survives_later_lookalike_candidates() {
+    let mut filesystem = build_filesystem(E::LE);
+    // Too small to hold a dirent attribute: the header validates, the
+    // chain does not.
+    filesystem[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&1u16.to_le_bytes());
+    // A trailing signature match that can only fail header validation.
+    filesystem.extend_from_slice(b"imagefs");
+    filesystem.extend_from_slice(&[0u8; 8]);
+
+    // The informative error from the real header wins over the noise
+    // from the trailing look-alike.
+    assert_eq!(
+        Image::parse_imagefs(&filesystem).unwrap_err(),
+        Error::BadDirent { offset: HEADER_LEN }
+    );
+}
+
+#[test]
+fn raw_mountpoint_preserves_non_utf8_bytes() {
+    let mountpoint = b"/mnt/\xff\xfe";
+    let header_len = align4(IMAGE_HEADER_SIZE + mountpoint.len() + 1);
+    let dir_area = 28 + 4; // one root directory dirent plus the terminator
+    let image_size = header_len + dir_area + 4; // plus the image trailer
+
+    let mut filesystem = image_header_raw(
+        E::LE,
+        image_size,
+        header_len + dir_area,
+        header_len,
+        mountpoint,
+    );
+    filesystem.extend(dirent(E::LE, 24, &[], "bin", None, 10, 0o040755));
+    filesystem.extend_from_slice(&[0u8; 4]); // dirent chain terminator
+    filesystem.extend_from_slice(&[0u8; 4]); // image trailer
+    assert_eq!(filesystem.len(), image_size);
+
+    let parsed = Image::parse_imagefs(&filesystem).expect("parse");
+    assert_eq!(parsed.image_header.raw_mountpoint, mountpoint);
+    assert_eq!(
+        parsed.image_header.mountpoint,
+        String::from_utf8_lossy(mountpoint)
+    );
+}
+
+#[test]
+fn entry_limit_is_enforced_for_bootable_images() {
+    let image_bytes = build_image(E::LE, TestCompress::None);
+
+    let limits = qnx_ifs::Limits::default().with_max_entries(4);
+    assert_eq!(
+        Image::parse_with_limits(&image_bytes, &limits).unwrap_err(),
+        Error::LimitsExceeded
+    );
+
+    let limits = qnx_ifs::Limits::default().with_max_entries(10);
+    assert!(Image::parse_with_limits(&image_bytes, &limits).is_ok());
 }

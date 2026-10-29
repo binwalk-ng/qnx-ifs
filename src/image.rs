@@ -31,8 +31,11 @@ use zerocopy::{
     byteorder::{BE, ByteOrder, LE},
 };
 
+use crate::Limits;
 use crate::error::Error;
 use crate::startup::Endian;
+
+use memchr_n::MemchrN;
 
 /// Image filesystem signature.
 pub const IMAGE_SIGNATURE: &[u8; 7] = b"imagefs";
@@ -117,7 +120,8 @@ struct DeviceExtraBytes<O: ByteOrder> {
 /// Multi-byte fields are [`U32`] byte-order wrappers; convert with their
 /// `get` method. Instantiate with `LE` or `BE` according to the header's
 /// [`BIGENDIAN`](crate::image::image_flags::BIGENDIAN) flag.
-/// [`parse_image_header`](crate::parse_image_header) validates and parses
+/// [`parse_image_header`] validates the size
+/// and offset relationships (see [`validate_image_header`]) and parses
 /// these fields into [`ImageHeader`].
 ///
 /// # Example
@@ -139,7 +143,7 @@ struct DeviceExtraBytes<O: ByteOrder> {
 pub struct ImageHeaderBytes<O: ByteOrder> {
     /// Image signature, always `imagefs`.
     pub signature: [u8; 7],
-    /// Flag byte; [`image_flags`](image_flags) names the bits.
+    /// Flag byte; [`image_flags`] names the bits.
     pub flags: u8,
     /// Byte size from the header to the end of the image trailer.
     pub image_size: U32<O>,
@@ -162,6 +166,7 @@ pub struct ImageHeaderBytes<O: ByteOrder> {
 
 /// Parsed image filesystem header.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ImageHeader {
     /// Size from the header to the end of the image trailer.
     pub image_size: usize,
@@ -181,10 +186,15 @@ pub struct ImageHeader {
     pub flags: u8,
     /// Default mountpoint of the image filesystem.
     pub mountpoint: String,
+    /// Mountpoint as raw stored bytes, before the lossy UTF-8 conversion
+    /// behind [`ImageHeader::mountpoint`]. Firmware paths may be
+    /// arbitrary bytes.
+    pub raw_mountpoint: Vec<u8>,
 }
 
 /// A single entry of the image filesystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Entry {
     /// Stored entry path, without a leading slash.
     pub path: String,
@@ -305,15 +315,15 @@ where
     T::ref_from_prefix(bytes).map(|(t, _)| t).map_err(|_| err)
 }
 
-/// Parse the common attributes of a dirent.
-fn parse_attr(dirent: &[u8], endian: Endian) -> Result<AttrParsed, Error> {
+/// Parse the common attributes of a dirent at absolute offset `offset`.
+fn parse_attr(dirent: &[u8], endian: Endian, offset: usize) -> Result<AttrParsed, Error> {
     match endian {
         Endian::Little => {
-            let attr = cast_prefix::<AttrBytes<LE>>(dirent, Error::BadDirent)?;
+            let attr = cast_prefix::<AttrBytes<LE>>(dirent, Error::BadDirent { offset })?;
             Ok(AttrParsed::from_bytes(attr))
         }
         Endian::Big => {
-            let attr = cast_prefix::<AttrBytes<BE>>(dirent, Error::BadDirent)?;
+            let attr = cast_prefix::<AttrBytes<BE>>(dirent, Error::BadDirent { offset })?;
             Ok(AttrParsed::from_bytes(attr))
         }
     }
@@ -359,21 +369,39 @@ impl AttrParsed {
 
 /// Scan `data` for the `"imagefs"` signature.
 ///
-/// Returns the offset of the first match, if any.
+/// Returns the offset of the first signature match, if any. The match is
+/// not validated: a container may hold look-alike strings before the
+/// real header, so prefer [`Image::parse_imagefs`](crate::Image::parse_imagefs),
+/// which tries each match in turn.
 pub fn find_image_header(data: &[u8]) -> Option<usize> {
     if data.len() < IMAGE_SIGNATURE.len() {
         return None;
     }
-    for off in 0..=(data.len() - IMAGE_SIGNATURE.len()) {
-        // Every occurrence starts with the same first byte.
-        if data[off] != b'i' {
-            continue;
-        }
-        if matches_signature(data, off) {
-            return Some(off);
-        }
+    let potential = &data[..data.len() - IMAGE_SIGNATURE.len() + 1];
+    // Every occurrence starts with the same first byte, SIMD-scanned.
+    MemchrN::new(b"i")
+        .iter(potential)
+        .find(|&off| matches_signature(data, off))
+}
+
+/// Byte offsets of every `"imagefs"` signature match in `data`.
+///
+/// Signature matches are not validated headers. Parse each candidate
+/// with [`parse_image_header`], which validates the recorded sizes and
+/// rejects look-alikes with [`Error::BadImageHeader`]; the first
+/// candidate that also walks a complete dirent chain is the image.
+/// [`Image::parse_imagefs`](crate::Image::parse_imagefs) does exactly
+/// this and is the simpler entry point.
+pub fn find_image_header_matches(data: &[u8]) -> Vec<usize> {
+    if data.len() < IMAGE_SIGNATURE.len() {
+        return Vec::new();
     }
-    None
+    let potential = &data[..data.len() - IMAGE_SIGNATURE.len() + 1];
+    let candidates = MemchrN::new(b"i");
+    candidates
+        .iter(potential)
+        .filter(|&off| matches_signature(data, off))
+        .collect()
 }
 
 /// Compare the seven signature bytes at `offset`.
@@ -385,6 +413,11 @@ fn matches_signature(data: &[u8], offset: usize) -> bool {
 ///
 /// The byte order comes from the `IMAGE_FLAGS_BIGENDIAN` flag byte; the
 /// mountpoint string follows the fixed fields.
+///
+/// The recorded sizes are validated with [`validate_image_header`], so
+/// the whole image must be present in `data`: this rejects headers whose
+/// `image_size` exceeds the buffer. Callers holding only a header prefix
+/// must locate the full image first.
 pub fn parse_image_header(data: &[u8], offset: usize) -> Result<(ImageHeader, Endian), Error> {
     let bytes = data.get(offset..).ok_or(Error::BadOffset)?;
     if bytes.len() < IMAGE_HEADER_SIZE {
@@ -395,46 +428,11 @@ pub fn parse_image_header(data: &[u8], offset: usize) -> Result<(ImageHeader, En
     let endian = Endian::from_image_flags(bytes[7]);
     let (image_size, hdr_dir_size, dir_offset, boot_ino, script_ino, chain_paddr, mountflags) =
         match endian {
-            Endian::Little => {
-                let (raw, _) = ImageHeaderBytes::<LE>::ref_from_prefix(bytes)
-                    .map_err(|_| Error::BadImageHeader)?;
-                if &raw.signature != IMAGE_SIGNATURE {
-                    return Err(Error::BadImageHeader);
-                }
-                header_fixed_fields(raw)
-            }
-            Endian::Big => {
-                let (raw, _) = ImageHeaderBytes::<BE>::ref_from_prefix(bytes)
-                    .map_err(|_| Error::BadImageHeader)?;
-                if &raw.signature != IMAGE_SIGNATURE {
-                    return Err(Error::BadImageHeader);
-                }
-                header_fixed_fields(raw)
-            }
+            Endian::Little => header_fixed_fields_checked::<LE>(bytes)?,
+            Endian::Big => header_fixed_fields_checked::<BE>(bytes)?,
         };
 
-    // The mountpoint is a NUL terminated string bounded by the dirent
-    // area. It only exists when `dir_offset` leaves room after the fixed
-    // fields; the scan must never run past the declared extent, and a
-    // `dir_offset` of exactly the fixed header size means there is no
-    // mountpoint at all.
-    //
-    // `hdr_dir_size` is another structural upper bound: clamping by it
-    // keeps an attacker-sized `dir_offset` from scanning and allocating
-    // to the end of the input before validation rejects the header. The
-    // `max` keeps the range valid if `hdr_dir_size` is itself below the
-    // fixed header size.
-    let mountpoint_end = if dir_offset > IMAGE_HEADER_SIZE {
-        dir_offset
-            .min(hdr_dir_size)
-            .min(bytes.len())
-            .max(IMAGE_HEADER_SIZE)
-    } else {
-        IMAGE_HEADER_SIZE
-    };
-    let (mountpoint, _) = cstring(&bytes[IMAGE_HEADER_SIZE..mountpoint_end]);
-
-    let header = ImageHeader {
+    let mut header = ImageHeader {
         image_size,
         hdr_dir_size,
         dir_offset,
@@ -443,10 +441,39 @@ pub fn parse_image_header(data: &[u8], offset: usize) -> Result<(ImageHeader, En
         chain_paddr,
         mountflags,
         flags: bytes[7],
-        mountpoint,
+        mountpoint: String::new(),
+        raw_mountpoint: Vec::new(),
     };
+
+    // Validate the declared sizes before reading anything out of the
+    // dirent area. The mountpoint scan is then bounded by a `dir_offset`
+    // that is known to be within `hdr_dir_size` and the input.
+    validate_image_header(data, offset, &header)?;
+
+    // The mountpoint is a NUL terminated string bounded by the dirent
+    // area. It only exists when `dir_offset` leaves room after the fixed
+    // fields; a `dir_offset` of exactly the fixed header size means there
+    // is no mountpoint at all.
+    let mountpoint_end = header.dir_offset.min(bytes.len());
+    let (mountpoint, raw) = cstring(&bytes[IMAGE_HEADER_SIZE..mountpoint_end]);
+    header.mountpoint = mountpoint;
+    header.raw_mountpoint = raw.to_vec();
+
     Ok((header, endian))
 }
+
+/// Parse and signature-check the fixed fields of the header at `bytes`.
+fn header_fixed_fields_checked<O: ByteOrder>(bytes: &[u8]) -> Result<HeaderFields, Error> {
+    let (raw, _) =
+        ImageHeaderBytes::<O>::ref_from_prefix(bytes).map_err(|_| Error::BadImageHeader)?;
+    if &raw.signature != IMAGE_SIGNATURE {
+        return Err(Error::BadImageHeader);
+    }
+    Ok(header_fixed_fields(raw))
+}
+
+/// Endian-independent fixed fields of a header.
+type HeaderFields = (usize, usize, usize, [u32; 4], u32, u32, u32);
 
 /// The signature must have been verified by the caller.
 const fn header_fixed_fields<O: ByteOrder>(
@@ -474,7 +501,11 @@ const fn header_fixed_fields<O: ByteOrder>(
 ///   `hdr_dir_size`
 /// * `hdr_dir_size` must not exceed `image_size - trailer`
 /// * the whole image must fit inside the available bytes
-pub(crate) fn validate_image_header(
+///
+/// Exposed so callers doing signature detection can validate a candidate
+/// header before committing to a full parse, without duplicating these
+/// rules.
+pub fn validate_image_header(
     slice: &[u8],
     header_offset: usize,
     header: &ImageHeader,
@@ -502,17 +533,27 @@ pub(crate) fn validate_image_header(
 /// and untrusted dirents must not enter the extraction set) and are not
 /// included in the returned entries. Whole-image callers can inspect
 /// the skipped records through [`crate::Image::omitted_dirents`].
+///
+/// Entry count is bounded by [`Limits::default`].
 pub fn parse_dirents(
     data: &[u8],
     base: usize,
     dir_pos: usize,
     endian: Endian,
 ) -> Result<Vec<Entry>, Error> {
-    let (entries, _) = parse_dirents_bounded(data, base, dir_pos, data.len(), data.len(), endian)?;
+    let (entries, _) = parse_dirents_bounded(
+        data,
+        base,
+        dir_pos,
+        data.len(),
+        data.len(),
+        endian,
+        &Limits::default(),
+    )?;
     Ok(entries)
 }
 
-/// Walk the dirent chain with explicit bounds.
+/// Walk the dirent chain with explicit bounds and limits.
 ///
 /// The chain must end with a zero size entry at or before `dir_end`
 /// (the end of the image directory area), and referenced file contents
@@ -527,6 +568,7 @@ pub(crate) fn parse_dirents_bounded(
     dir_end: usize,
     data_end: usize,
     endian: Endian,
+    limits: &Limits,
 ) -> Result<(Vec<Entry>, Vec<OmittedDirent>), Error> {
     let mut entries = Vec::new();
     let mut omitted: Vec<OmittedDirent> = Vec::new();
@@ -535,13 +577,13 @@ pub(crate) fn parse_dirents_bounded(
     loop {
         // Only two bytes are required to detect the terminator: mkifs
         // reserves four, but the stored entry is a zero `u16` size.
-        let header_end = pos.checked_add(2).ok_or(Error::UnterminatedDirents)?;
+        let header_end = pos
+            .checked_add(2)
+            .ok_or(Error::UnterminatedDirents { offset: pos })?;
         if header_end > dir_end || header_end > data_end {
-            return Err(Error::UnterminatedDirents);
+            return Err(Error::UnterminatedDirents { offset: pos });
         }
-        let size_bytes = data
-            .get(pos..header_end)
-            .ok_or(Error::UnterminatedDirents)?;
+        let size_bytes = &data[pos..header_end];
         let size = match endian {
             Endian::Little => u16::from_le_bytes([size_bytes[0], size_bytes[1]]),
             Endian::Big => u16::from_be_bytes([size_bytes[0], size_bytes[1]]),
@@ -551,14 +593,16 @@ pub(crate) fn parse_dirents_bounded(
             return Ok((entries, omitted));
         }
         if size < 24 {
-            return Err(Error::BadDirent);
+            return Err(Error::BadDirent { offset: pos });
         }
-        let end = pos.checked_add(size).ok_or(Error::BadDirent)?;
+        let end = pos
+            .checked_add(size)
+            .ok_or(Error::BadDirent { offset: pos })?;
         if end > dir_end || end > data_end {
-            return Err(Error::BadDirent);
+            return Err(Error::BadDirent { offset: pos });
         }
-        let dirent = data.get(pos..end).ok_or(Error::BadDirent)?;
-        let attr = parse_attr(&dirent[..24], endian)?;
+        let dirent = &data[pos..end];
+        let attr = parse_attr(&dirent[..24], endian, pos)?;
 
         // The kernel skips entries whose inode is zero (sys/image.h).
         // They are recorded in the quarantine list rather than being
@@ -579,28 +623,34 @@ pub(crate) fn parse_dirents_bounded(
         }
 
         let entry = match attr.mode & S_IFMT {
-            S_IFREG => parse_file_entry(data, base, dirent, &attr, endian, data_end)?,
+            S_IFREG => parse_file_entry(data, base, pos, dirent, &attr, endian, data_end)?,
             S_IFDIR => parse_dir_entry(dirent, &attr),
-            S_IFLNK => parse_symlink_entry(dirent, &attr, endian)?,
+            S_IFLNK => parse_symlink_entry(pos, dirent, &attr, endian)?,
             S_IFCHR | S_IFBLK | S_IFIFO | S_IFNAM | S_IFSOCK => {
-                parse_device_entry(dirent, &attr, endian)?
+                parse_device_entry(pos, dirent, &attr, endian)?
             }
-            _ => return Err(Error::UnknownDirentType),
+            _ => return Err(Error::UnknownDirentType { offset: pos }),
         };
+        if entries.len() >= limits.max_entries {
+            return Err(Error::LimitsExceeded);
+        }
         entries.push(entry);
         pos = end;
     }
 }
 
 /// Read the type specific fields of a file dirent in byte order `O`.
-fn file_extra_fields<O: ByteOrder>(bytes: &[u8]) -> Result<(usize, usize), Error> {
-    let extra = cast_prefix::<FileExtraBytes<O>>(bytes, Error::BadDirent)?;
+fn file_extra_fields<O: ByteOrder>(bytes: &[u8], offset: usize) -> Result<(usize, usize), Error> {
+    let extra = cast_prefix::<FileExtraBytes<O>>(bytes, Error::BadDirent { offset })?;
     Ok((extra.offset.get() as usize, extra.size.get() as usize))
 }
 
 /// Read the type specific fields of a symlink dirent in byte order `O`.
-fn symlink_extra_fields<O: ByteOrder>(bytes: &[u8]) -> Result<(usize, usize), Error> {
-    let extra = cast_prefix::<SymlinkExtraBytes<O>>(bytes, Error::BadDirent)?;
+fn symlink_extra_fields<O: ByteOrder>(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<(usize, usize), Error> {
+    let extra = cast_prefix::<SymlinkExtraBytes<O>>(bytes, Error::BadDirent { offset })?;
     Ok((
         extra.sym_offset.get() as usize,
         extra.sym_size.get() as usize,
@@ -608,8 +658,8 @@ fn symlink_extra_fields<O: ByteOrder>(bytes: &[u8]) -> Result<(usize, usize), Er
 }
 
 /// Read the type specific fields of a device dirent in byte order `O`.
-fn device_extra_fields<O: ByteOrder>(bytes: &[u8]) -> Result<(u32, u32), Error> {
-    let extra = cast_prefix::<DeviceExtraBytes<O>>(bytes, Error::BadDirent)?;
+fn device_extra_fields<O: ByteOrder>(bytes: &[u8], offset: usize) -> Result<(u32, u32), Error> {
+    let extra = cast_prefix::<DeviceExtraBytes<O>>(bytes, Error::BadDirent { offset })?;
     Ok((extra.dev.get(), extra.rdev.get()))
 }
 
@@ -630,6 +680,7 @@ fn cstring(bytes: &[u8]) -> (String, &[u8]) {
 fn parse_file_entry(
     data: &[u8],
     base: usize,
+    offset: usize,
     dirent: &[u8],
     attr: &AttrParsed,
     endian: Endian,
@@ -637,24 +688,31 @@ fn parse_file_entry(
 ) -> Result<Entry, Error> {
     // attr (24) + offset (4) + size (4), path may be empty.
     if dirent.len() < 32 {
-        return Err(Error::BadDirent);
+        return Err(Error::BadDirent { offset });
     }
-    let (offset, size) = match endian {
-        Endian::Little => file_extra_fields::<LE>(&dirent[24..])?,
-        Endian::Big => file_extra_fields::<BE>(&dirent[24..])?,
+    let (file_offset, size) = match endian {
+        Endian::Little => file_extra_fields::<LE>(&dirent[24..], offset)?,
+        Endian::Big => file_extra_fields::<BE>(&dirent[24..], offset)?,
     };
     let (path, raw_path) = cstring(&dirent[32..]);
 
     // File contents must lie inside the image data.
     let abs = base
-        .checked_add(offset)
+        .checked_add(file_offset)
         .and_then(|abs| abs.checked_add(size))
         .ok_or(Error::BadOffset)?;
     if abs > data_end || abs > data.len() {
         return Err(Error::BadOffset);
     }
 
-    Ok(attr.entry_common(path, raw_path.to_vec(), EntryKind::File { offset, size }))
+    Ok(attr.entry_common(
+        path,
+        raw_path.to_vec(),
+        EntryKind::File {
+            offset: file_offset,
+            size,
+        },
+    ))
 }
 
 /// Parse a `S_IFDIR` directory entry.
@@ -672,18 +730,29 @@ fn parse_dir_entry(dirent: &[u8], attr: &AttrParsed) -> Entry {
 ///
 /// `sym_offset` is relative to the `path` field at offset 28; the target
 /// of `sym_size` bytes follows the path inline.
-fn parse_symlink_entry(dirent: &[u8], attr: &AttrParsed, endian: Endian) -> Result<Entry, Error> {
+fn parse_symlink_entry(
+    offset: usize,
+    dirent: &[u8],
+    attr: &AttrParsed,
+    endian: Endian,
+) -> Result<Entry, Error> {
     // attr (24) + sym_offset (2) + sym_size (2) + path + target.
     if dirent.len() < 28 {
-        return Err(Error::BadDirent);
+        return Err(Error::BadDirent { offset });
     }
     let (sym_offset, sym_size) = match endian {
-        Endian::Little => symlink_extra_fields::<LE>(&dirent[24..])?,
-        Endian::Big => symlink_extra_fields::<BE>(&dirent[24..])?,
+        Endian::Little => symlink_extra_fields::<LE>(&dirent[24..], offset)?,
+        Endian::Big => symlink_extra_fields::<BE>(&dirent[24..], offset)?,
     };
 
-    let path_end = 28usize.checked_add(sym_offset).ok_or(Error::BadDirent)?;
-    let (path, raw_path) = cstring(dirent.get(28..path_end).ok_or(Error::BadDirent)?);
+    let path_end = 28usize
+        .checked_add(sym_offset)
+        .ok_or(Error::BadDirent { offset })?;
+    let (path, raw_path) = cstring(
+        dirent
+            .get(28..path_end)
+            .ok_or(Error::BadDirent { offset })?,
+    );
 
     let kind = if sym_size == 0 {
         EntryKind::Symlink {
@@ -691,9 +760,14 @@ fn parse_symlink_entry(dirent: &[u8], attr: &AttrParsed, endian: Endian) -> Resu
             raw_target: Vec::new(),
         }
     } else {
-        let target_end = path_end.checked_add(sym_size).ok_or(Error::BadDirent)?;
-        let (target, raw_target) =
-            cstring(dirent.get(path_end..target_end).ok_or(Error::BadDirent)?);
+        let target_end = path_end
+            .checked_add(sym_size)
+            .ok_or(Error::BadDirent { offset })?;
+        let (target, raw_target) = cstring(
+            dirent
+                .get(path_end..target_end)
+                .ok_or(Error::BadDirent { offset })?,
+        );
         EntryKind::Symlink {
             target,
             raw_target: raw_target.to_vec(),
@@ -704,14 +778,19 @@ fn parse_symlink_entry(dirent: &[u8], attr: &AttrParsed, endian: Endian) -> Resu
 }
 
 /// Parse a device type directory entry (char/block/fifo/named/socket).
-fn parse_device_entry(dirent: &[u8], attr: &AttrParsed, endian: Endian) -> Result<Entry, Error> {
+fn parse_device_entry(
+    offset: usize,
+    dirent: &[u8],
+    attr: &AttrParsed,
+    endian: Endian,
+) -> Result<Entry, Error> {
     // attr (24) + dev (4) + rdev (4), followed by the path.
     if dirent.len() < 32 {
-        return Err(Error::BadDirent);
+        return Err(Error::BadDirent { offset });
     }
     let (dev, rdev) = match endian {
-        Endian::Little => device_extra_fields::<LE>(&dirent[24..])?,
-        Endian::Big => device_extra_fields::<BE>(&dirent[24..])?,
+        Endian::Little => device_extra_fields::<LE>(&dirent[24..], offset)?,
+        Endian::Big => device_extra_fields::<BE>(&dirent[24..], offset)?,
     };
 
     let kind = match attr.mode & S_IFMT {

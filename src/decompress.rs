@@ -14,18 +14,62 @@
 use crate::error::Error;
 use crate::startup::Compress;
 
-/// Safety limits for decompressing untrusted data.
+/// Safety limits for parsing untrusted data.
+///
+/// The struct is `#[non_exhaustive]`: bounds are added over time, so
+/// start from [`Default`] and override the fields that matter to the
+/// caller, either by assignment or with the `with_*` builders.
+///
+/// ```
+/// use qnx_ifs::Limits;
+///
+/// let mut limits = Limits::default();
+/// limits.max_decompressed = 64 * 1024 * 1024;
+///
+/// let limits = Limits::default().with_max_entries(4096);
+/// # let _ = limits;
+/// ```
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Limits {
     /// Maximum total decompressed output in bytes. Defaults to 256 MiB.
     pub max_decompressed: usize,
+    /// Maximum number of directory entries parsed. Defaults to 1M.
+    pub max_entries: usize,
+    /// Maximum length of the header mountpoint string. Defaults to 4 KiB.
+    pub max_mountpoint_len: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
             max_decompressed: 256 * 1024 * 1024,
+            max_entries: 1_000_000,
+            max_mountpoint_len: 4096,
         }
+    }
+}
+
+impl Limits {
+    /// Set [`Limits::max_decompressed`].
+    #[must_use]
+    pub const fn with_max_decompressed(mut self, max_decompressed: usize) -> Self {
+        self.max_decompressed = max_decompressed;
+        self
+    }
+
+    /// Set [`Limits::max_entries`].
+    #[must_use]
+    pub const fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries;
+        self
+    }
+
+    /// Set [`Limits::max_mountpoint_len`].
+    #[must_use]
+    pub const fn with_max_mountpoint_len(mut self, max_mountpoint_len: usize) -> Self {
+        self.max_mountpoint_len = max_mountpoint_len;
+        self
     }
 }
 

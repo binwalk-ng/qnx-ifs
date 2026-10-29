@@ -141,9 +141,7 @@ fn rejects_malformed_framing() {
 fn enforces_output_limits() {
     // One block that expands past the configured limit.
     let region = lzokay_region(&vec![0u8; 2048]);
-    let limits = Limits {
-        max_decompressed: 1024,
-    };
+    let limits = Limits::default().with_max_decompressed(1024);
     assert_eq!(
         decompress_region(&region, Compress::Lzo, &limits),
         Err(Error::DecompressTooLarge)

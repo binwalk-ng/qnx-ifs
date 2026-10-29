@@ -40,6 +40,9 @@
 //! - An in-memory entry model, including raw stored path bytes for
 //!   byte-exact extraction of non-UTF-8 names
 //!
+//! Extended attribute data (`extattr_offset`) is surfaced on
+//! [`Entry`] / [`OmittedDirent`]; its contents are not parsed.
+//!
 //! This crate performs **no filesystem I/O**. Writing entries to disk
 //! (path sanitization, symlink handling, permissions, timestamps) is
 //! intentionally left to callers.
@@ -68,7 +71,8 @@ pub mod ucl;
 pub use error::Error;
 pub use image::{
     Entry, EntryKind, IMAGE_HEADER_SIZE, ImageHeader, ImageHeaderBytes, MAX_OMITTED_DIRENTS,
-    OmittedDirent, find_image_header, parse_dirents, parse_image_header,
+    OmittedDirent, find_image_header, find_image_header_matches, parse_dirents, parse_image_header,
+    validate_image_header,
 };
 
 mod startup;
@@ -236,6 +240,26 @@ impl<'a> Image<'a> {
             return Err(Error::BadStartupHeader);
         };
 
+        Self::parse_from_startup(data, startup_offset, startup, &options.limits)
+    }
+
+    /// Parse a bootable image whose startup header is at `startup_offset`.
+    ///
+    /// Like [`Image::parse`], but skips the whole-buffer startup-header
+    /// search: callers that already confirmed the match offset avoid an
+    /// `O(n)` rescan. Strict validation applies.
+    pub fn parse_at(data: &'a [u8], startup_offset: usize) -> Result<Self, Error> {
+        let startup = startup::parse_startup_header(data, startup_offset)?;
+        Self::parse_from_startup(data, startup_offset, startup, &Limits::default())
+    }
+
+    /// Finish parsing given a parsed startup header and its offset.
+    fn parse_from_startup(
+        data: &'a [u8],
+        startup_offset: usize,
+        startup: StartupHeader,
+        limits: &Limits,
+    ) -> Result<Self, Error> {
         // Bytes past `stored_size` belong to the container, not the image.
         let startup_end = startup_offset
             .checked_add(startup.startup_size)
@@ -267,8 +291,7 @@ impl<'a> Image<'a> {
             }
             Compress::Zlib | Compress::Lzo | Compress::Ucl => {
                 let region = &data[startup_end..stored_end];
-                let mut decoded =
-                    decompress::decompress_region(region, startup.compress, &options.limits)?;
+                let mut decoded = decompress::decompress_region(region, startup.compress, limits)?;
                 if let Some(size) = declared_filesystem_size {
                     if decoded.len() < size {
                         return Err(Error::Truncated);
@@ -279,82 +302,132 @@ impl<'a> Image<'a> {
             }
         };
 
-        let slice = match &filesystem {
-            ImageData::Borrowed(borrowed) => *borrowed,
-            ImageData::Owned(owned) => owned,
-        };
+        let slice = filesystem.as_slice();
         let search_start = search_start.min(slice.len());
-        let relative =
-            image::find_image_header(&slice[search_start..]).ok_or(Error::BadImageHeader)?;
-        let header_offset = search_start.checked_add(relative).ok_or(Error::BadOffset)?;
-
-        Self::from_parts(
-            data,
-            Some(startup),
-            startup_offset,
-            filesystem,
-            header_offset,
-        )
+        // First signature match that parses into a complete filesystem;
+        // later matches are tried so a look-alike string early in the
+        // buffer cannot mask the real image.
+        let mut errors = CandidateErrors::default();
+        for relative in image::find_image_header_matches(&slice[search_start..]) {
+            let Some(header_offset) = search_start.checked_add(relative) else {
+                return Err(Error::BadOffset);
+            };
+            match Self::filesystem_parts(slice, header_offset, limits) {
+                Ok(parts) => {
+                    return Ok(Self {
+                        startup: Some(startup),
+                        startup_offset,
+                        header_offset: parts.header_offset,
+                        image_header: parts.header,
+                        endian: parts.endian,
+                        entries: parts.entries,
+                        omitted_dirents: parts.omitted,
+                        filesystem,
+                        source: data,
+                    });
+                }
+                Err(err) => errors.record(err),
+            }
+        }
+        Err(errors.finish())
     }
 
     /// Parse a bare `imagefs` filesystem, searching the whole input.
     ///
-    /// Accepts an `imagefs` header anywhere in `data`, e.g. inside a
-    /// container with a vendor-specific prefix.
+    /// Accepts the first signature match that parses into a complete
+    /// image filesystem, so look-alike strings before the real header
+    /// cannot prevent detection. A header that validates but has a
+    /// malformed dirent chain is skipped like any other candidate; if no
+    /// candidate succeeds, the most informative error is returned. See
+    /// also [`Image::parse_imagefs_at`].
     pub fn parse_imagefs(data: &'a [u8]) -> Result<Self, Error> {
         Self::parse_imagefs_with_limits(data, &Limits::default())
     }
 
-    /// Parse a bare `imagefs` filesystem with decompression limits.
-    ///
-    /// Decompression limits are only relevant to full images with a
-    /// startup header; bare `imagefs` filesystems are always uncompressed.
+    /// Parse a bare `imagefs` filesystem with parsing [`Limits`].
     pub fn parse_imagefs_with_limits(data: &'a [u8], limits: &Limits) -> Result<Self, Error> {
-        let _ = limits;
-        let header_offset = image::find_image_header(data).ok_or(Error::BadImageHeader)?;
-        Self::from_parts(data, None, 0, ImageData::Borrowed(data), header_offset)
+        let mut errors = CandidateErrors::default();
+        for header_offset in image::find_image_header_matches(data) {
+            match Self::imagefs_parts(data, header_offset, limits) {
+                Ok(image) => return Ok(image),
+                Err(err) => errors.record(err),
+            }
+        }
+        Err(errors.finish())
     }
 
-    /// Finish parsing given a filesystem buffer and header position.
-    fn from_parts(
-        source: &'a [u8],
-        startup: Option<StartupHeader>,
-        startup_offset: usize,
-        filesystem: ImageData<'a>,
-        header_offset: usize,
+    /// Parse a bare `imagefs` filesystem whose header is at `offset`.
+    ///
+    /// Like [`Image::parse_imagefs`], but without the whole-buffer scan:
+    /// callers that already confirmed the match offset (e.g. from
+    /// signature detection) avoid a repeated scan. Returns an error when
+    /// the header at `offset` is not valid; no later candidates are tried.
+    pub fn parse_imagefs_at(data: &'a [u8], offset: usize) -> Result<Self, Error> {
+        Self::parse_imagefs_at_with_limits(data, offset, &Limits::default())
+    }
+
+    /// Parse a bare `imagefs` filesystem at `offset` with parsing [`Limits`].
+    pub fn parse_imagefs_at_with_limits(
+        data: &'a [u8],
+        offset: usize,
+        limits: &Limits,
     ) -> Result<Self, Error> {
-        let slice = filesystem.as_slice();
-        let (image_header, endian) = image::parse_image_header(slice, header_offset)?;
-        image::validate_image_header(slice, header_offset, &image_header)?;
+        Self::imagefs_parts(data, offset, limits)
+    }
+
+    /// Build an [`Image`] over an already located bare filesystem header.
+    fn imagefs_parts(data: &'a [u8], header_offset: usize, limits: &Limits) -> Result<Self, Error> {
+        let parts = Self::filesystem_parts(data, header_offset, limits)?;
+        Ok(Self {
+            startup: None,
+            startup_offset: 0,
+            header_offset: parts.header_offset,
+            image_header: parts.header,
+            endian: parts.endian,
+            entries: parts.entries,
+            omitted_dirents: parts.omitted,
+            filesystem: ImageData::Borrowed(data),
+            source: data,
+        })
+    }
+
+    /// Parse the image filesystem header and dirent chain at `header_offset`.
+    fn filesystem_parts(
+        slice: &[u8],
+        header_offset: usize,
+        limits: &Limits,
+    ) -> Result<ImageParts, Error> {
+        // The header parse validates the recorded sizes as well.
+        let (header, endian) = image::parse_image_header(slice, header_offset)?;
+        if header.raw_mountpoint.len() > limits.max_mountpoint_len {
+            return Err(Error::LimitsExceeded);
+        }
 
         let dirent_start = header_offset
-            .checked_add(image_header.dir_offset)
+            .checked_add(header.dir_offset)
             .ok_or(Error::BadOffset)?;
         let dirent_end = header_offset
-            .checked_add(image_header.hdr_dir_size)
+            .checked_add(header.hdr_dir_size)
             .ok_or(Error::BadOffset)?;
         let data_end = header_offset
-            .checked_add(image_header.image_size)
+            .checked_add(header.image_size)
             .ok_or(Error::BadOffset)?;
-        let (entries, omitted_dirents) = image::parse_dirents_bounded(
+        let (entries, omitted) = image::parse_dirents_bounded(
             slice,
             header_offset,
             dirent_start,
             dirent_end,
             data_end,
             endian,
+            limits,
         )?;
 
-        Ok(Self {
-            startup,
-            startup_offset,
+        Ok(ImageParts {
             header_offset,
-            image_header,
+            header,
             endian,
             entries,
-            omitted_dirents,
-            filesystem,
-            source,
+            omitted,
         })
     }
 
@@ -475,6 +548,47 @@ fn checksum_region(bytes: &[u8], endian: Endian) -> u32 {
         sum = sum.wrapping_add(read_word(word, endian));
     }
     sum.wrapping_neg()
+}
+
+/// Parsed image filesystem header plus its dirent chain.
+struct ImageParts {
+    header_offset: usize,
+    header: ImageHeader,
+    endian: Endian,
+    entries: Vec<Entry>,
+    omitted: Vec<OmittedDirent>,
+}
+
+/// Errors collected while trying signature candidates in a scan.
+///
+/// Candidates are signature matches, most of which are accidental
+/// look-alikes inside file contents. A plain header rejection
+/// ([`Error::BadImageHeader`], or [`Error::Truncated`] when the match is
+/// too close to the end of the buffer to hold a header) says nothing
+/// about the real image, so the first error from a candidate that got
+/// any further is kept and reported in preference to the (usually
+/// meaningless) last one.
+#[derive(Default)]
+struct CandidateErrors {
+    first: Option<Error>,
+    substantive: Option<Error>,
+}
+
+impl CandidateErrors {
+    fn record(&mut self, err: Error) {
+        if self.substantive.is_none() && !matches!(err, Error::BadImageHeader | Error::Truncated) {
+            self.substantive = Some(err.clone());
+        }
+        if self.first.is_none() {
+            self.first = Some(err);
+        }
+    }
+
+    fn finish(self) -> Error {
+        self.substantive
+            .or(self.first)
+            .unwrap_or(Error::BadImageHeader)
+    }
 }
 
 /// Size of a regular file entry payload.

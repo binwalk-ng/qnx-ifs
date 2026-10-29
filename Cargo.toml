@@ -1,11 +1,11 @@
 [package]
 name = "qnx-ifs"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/binwalk-ng/qnx-ifs"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Pure-Rust parser and decompressor for QNX IFS (Image File System) firmware images"
 keywords = ["qnx", "firmware", "ifs", "parser", "security"]
 categories = ["parser-implementations", "filesystem", "security"]
@@ -32,6 +32,7 @@ ucl = []
 zerocopy = { version = "0.8.28", features = ["derive"] }
 flate2 = { version = "1.1.10", optional = true }
 lzo = { version = "0.1.4", optional = true }
+memchr-n = "0.1.10"
 
 [dev-dependencies]
 # Independent pure-Rust LZO1X compressor, used only to generate round-trip

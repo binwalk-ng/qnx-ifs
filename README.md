@@ -65,7 +65,9 @@ without a leading slash.
 | --- | --- |
 | `Image::parse` / `parse_with_limits` | Parse a bootable image or bare filesystem from a byte slice |
 | `Image::parse_with_options` | Full `ParseOptions`: decompression limits plus opt-in startup-header leniency |
-| `Image::parse_imagefs` | Parse a bare `imagefs` found anywhere in a container |
+| `Image::parse_at` | Parse a bootable image whose startup header is at a known offset (no whole-buffer rescan) |
+| `Image::parse_imagefs` | Parse a bare `imagefs`: the first signature match that fully validates |
+| `Image::parse_imagefs_at` / `_with_limits` | Parse a bare `imagefs` at a known header offset, without scanning |
 | `Image::total_size` | Bytes consumed by the image (startup `stored_size`, or the bare filesystem extent) |
 | `Image::file_bytes` | Contents of a regular file entry |
 | `Image::startup_bytes` | The uncompressed startup program section |
@@ -73,12 +75,13 @@ without a leading slash.
 | `Image::omitted_dirents` | Skipped zero-inode dirents, quarantined for reporting |
 | `Image::image_checksum` / `startup_checksum` | Stored vs. recomputed trailer checksum pair (`Checksums::valid`) |
 | `StartupHeader` | Startup header fields: machine, load addresses, sizes, endianness, compression |
-| `ImageHeader` | Mountpoint, flags, inode metadata, chain info |
+| `ImageHeader` | Mountpoint (`mountpoint`/`raw_mountpoint`), flags, inode metadata, chain info |
 | `ImageHeaderBytes` | On-disk `struct image_header` layout (`U32` byte-order fields) for hand-casting raw bytes |
 | `IMAGE_HEADER_SIZE` | Byte size of the fixed image header fields; the NUL terminated mountpoint starts at this offset |
 | `Entry` / `EntryKind` | Path, raw path bytes, inode, mode, uid/gid/mtime, and the type-specific payload |
 | `ImageData` | Decompressed or borrowed filesystem bytes (`Deref<Target = [u8]>`) |
-| `Limits` / `ParseOptions` | Decompression bounds and parsing policy knobs |
+| `Limits` / `ParseOptions` | Decompression bounds (entry count or mountpoint caps are also in `Limits`) and parsing policy knobs |
+| `validate_image_header` / `find_image_header_matches` | Validate a candidate header without a full parse; enumerate all signature candidates |
 
 ### Parsing policy
 
@@ -87,6 +90,15 @@ behaviour only where that is also the safest choice:
 
 - A bare `imagefs` header at offset 0 wins over a deeper startup header,
   so embedded look-alike data cannot hijack the parse.
+- Signature detection is not first-match. A candidate is accepted only
+  when its recorded sizes validate *and* its dirent chain parses
+  completely, and candidates are tried in order, so a look-alike string
+  ahead of the real header cannot mask it. The converse also holds: if
+  the real header is corrupt, an embedded look-alike that parses
+  cleanly is accepted in its place, and `Image::header_offset` reports
+  which one won. When no candidate parses, the first error from a
+  candidate that got past header validation is returned rather than the
+  error from the last (usually accidental) match.
 - The startup header's signature, version, size relationships and
   reserve fields are all validated before anything is decompressed.
   `ParseOptions::lenient_startup_header` relaxes only the reserve-field

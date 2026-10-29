@@ -15,12 +15,23 @@ pub enum Error {
     BadStartupHeaderZeros,
     /// The image filesystem signature is not valid.
     BadImageHeader,
-    /// A directory entry of the image filesystem is malformed.
-    BadDirent,
+    /// A directory entry of the image filesystem is malformed. The
+    /// offset is the byte position of the dirent in the parsed buffer.
+    BadDirent {
+        /// Absolute byte offset of the dirent.
+        offset: usize,
+    },
     /// The dirent chain ran out of data without a terminating entry.
-    UnterminatedDirents,
+    /// The offset is where the last dirent ended.
+    UnterminatedDirents {
+        /// Absolute byte offset where the chain ran out.
+        offset: usize,
+    },
     /// A directory entry with an unknown file type was encountered.
-    UnknownDirentType,
+    UnknownDirentType {
+        /// Absolute byte offset of the dirent.
+        offset: usize,
+    },
     /// The startup header declares an unknown compression type.
     UnknownCompression(u8),
     /// The requested backend is compiled out of this build.
@@ -29,6 +40,8 @@ pub enum Error {
     Decompress(String),
     /// The decompressed data exceeded a configured sanity limit.
     DecompressTooLarge,
+    /// A configured [`Limits`](crate::Limits) bound was exceeded.
+    LimitsExceeded,
     /// Data referenced by an offset lies outside the image.
     BadOffset,
 }
@@ -40,11 +53,24 @@ impl std::fmt::Display for Error {
             Self::BadStartupHeader => write!(f, "invalid QNX IFS startup header"),
             Self::BadStartupHeaderZeros => write!(f, "startup header zero fields not zero"),
             Self::BadImageHeader => write!(f, "invalid QNX IFS image filesystem header"),
-            Self::BadDirent => write!(f, "malformed image filesystem directory entry"),
-            Self::UnterminatedDirents => {
-                write!(f, "dirent chain ended without terminating entry")
+            Self::BadDirent { offset } => {
+                write!(
+                    f,
+                    "malformed image filesystem directory entry at offset {offset:#x}"
+                )
             }
-            Self::UnknownDirentType => write!(f, "directory entry has unknown file type"),
+            Self::UnterminatedDirents { offset } => {
+                write!(
+                    f,
+                    "dirent chain ended without terminating entry at offset {offset:#x}"
+                )
+            }
+            Self::UnknownDirentType { offset } => {
+                write!(
+                    f,
+                    "directory entry at offset {offset:#x} has unknown file type"
+                )
+            }
             Self::UnknownCompression(t) => {
                 write!(f, "unknown compression flags value 0x{t:02x}")
             }
@@ -55,6 +81,7 @@ impl std::fmt::Display for Error {
             Self::DecompressTooLarge => {
                 write!(f, "decompressed size exceeds configured limit")
             }
+            Self::LimitsExceeded => write!(f, "parsing limit exceeded"),
             Self::BadOffset => write!(f, "struct field offset out of bounds"),
         }
     }

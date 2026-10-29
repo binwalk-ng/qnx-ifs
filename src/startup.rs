@@ -4,6 +4,7 @@
 //! `STARTUP_HDR_FLAGS1_BIGENDIAN` flag; the signature magic and the flag
 //! bytes are endian neutral, so byte-swapped magic is accepted too.
 
+use memchr_n::MemchrN;
 use zerocopy::{
     FromBytes, Immutable, KnownLayout, U16, U32, Unaligned,
     byteorder::{BE, ByteOrder, LE},
@@ -41,13 +42,14 @@ pub fn find_startup_header_lenient(data: &[u8], lenient: bool) -> Option<(usize,
     if data.len() < STARTUP_HEADER_SIZE {
         return None;
     }
-    for off in 0..=data.len() - STARTUP_HEADER_SIZE {
-        // Both magic orientations start with a distinct first byte; a
-        // cheap compare filters the majority of offsets.
-        let first = data[off];
-        if first != STARTUP_MAGIC_LE[0] && first != STARTUP_MAGIC_BE[0] {
-            continue;
-        }
+    // Both magic orientations start with a distinct first byte; the SIMD
+    // scan over that byte pair filters the majority of offsets.
+    //
+    // Only potential header starts are searched: the fixed 64-byte prefix
+    // must fit.
+    let potential = &data[..data.len() - STARTUP_HEADER_SIZE + 1];
+    let candidates = MemchrN::new(&[STARTUP_MAGIC_LE[0], STARTUP_MAGIC_BE[0]]);
+    for off in candidates.iter(potential) {
         let matches_magic =
             data[off..off + 4] == STARTUP_MAGIC_LE || data[off..off + 4] == STARTUP_MAGIC_BE;
         if matches_magic && let Ok(hdr) = parse_startup_header_opts(data, off, lenient) {
